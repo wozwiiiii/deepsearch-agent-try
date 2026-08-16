@@ -91,7 +91,7 @@ export function FileDock({ files, onRefresh, sessionPath }: FileDockProps) {
                 <Button
                   aria-label={`下载 ${file.name}`}
                   className="icon-button"
-                  href={getDownloadUrl(file.path)}
+                  href={getDownloadUrl(file.thread_id, file.path)}
                   icon={<DownloadOutlined />}
                   shape="circle"
                 />

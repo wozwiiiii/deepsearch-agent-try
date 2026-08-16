@@ -7,6 +7,7 @@ execute_sql_query 用于在确认结构后执行自定义查询。
 """
 
 import os
+import re
 
 from dotenv import load_dotenv
 from langchain_core.tools import tool
@@ -15,6 +16,89 @@ from mysql.connector import Error, connect
 from app.api.monitor import monitor
 
 load_dotenv()
+
+# ---------------------------------------------------------------------------
+# SQL 只读防护（生产化改造）
+#
+# 原版 execute_sql_query 依赖提示词约束模型只生成 SELECT，工具层不做校验，
+# 且连接开启 autocommit，一旦模型生成 DML/DDL 会真实生效。
+# 防护分两层：
+# 1. 工具层：assert_readonly_sql 只放行 SELECT/SHOW/DESCRIBE/EXPLAIN 单条语句；
+# 2. 账号层：部署时为 Agent 单独创建仅 SELECT 权限的 MySQL 账号（见
+#    docs/PRODUCTION_NOTES.md），工具层被绕过时仍有数据库权限兜底。
+# ---------------------------------------------------------------------------
+
+# 去掉 -- 注释、# 注释和 /* */ 块注释后再做语句校验，防止用注释伪装语句开头
+_SQL_COMMENT_PATTERN = re.compile(r"--[^\n]*|#[^\n]*|/\*.*?\*/", re.S)
+
+# 语句必须以这些只读关键字开头（大小写不敏感）
+_READONLY_SQL_START_PATTERN = re.compile(
+    r"^\s*(SELECT|SHOW|DESCRIBE|DESC|EXPLAIN)\b", re.IGNORECASE
+)
+
+# 语句中不允许出现的写操作/危险关键字；保守起见全语句匹配，
+# 若业务表字段名恰好命中这些词，需要先改名再接入本工具
+_FORBIDDEN_SQL_KEYWORD_PATTERN = re.compile(
+    r"\b("
+    r"INSERT|UPDATE|DELETE|REPLACE|DROP|ALTER|CREATE|TRUNCATE|RENAME|"
+    r"GRANT|REVOKE|LOCK|UNLOCK|CALL|SET|KILL|SHUTDOWN|HANDLER|LOAD|"
+    r"LOAD_FILE|LOAD_DATA|PREPARE|EXECUTE"
+    r")\b|INTO\s+(OUTFILE|DUMPFILE)",
+    re.IGNORECASE,
+)
+
+# 合法表名只允许字母、数字和下划线，配合反引号包裹彻底杜绝表名注入
+_TABLE_NAME_PATTERN = re.compile(r"^[A-Za-z0-9_]{1,64}$")
+
+
+class SQLSafetyError(ValueError):
+    """SQL 未通过只读校验时抛出，由工具捕获后转为模型可读的错误提示"""
+
+
+def assert_readonly_sql(query: str) -> str:
+    """
+    校验 SQL 语句只读，返回去除注释和结尾分号后的语句
+
+    :param query: 模型生成的 SQL
+    :return: 清理后的 SQL 文本
+    :raises SQLSafetyError: 空语句、多语句、非只读语句或包含危险关键字
+    """
+    if not query or not query.strip():
+        raise SQLSafetyError("SQL 语句不能为空")
+
+    cleaned = _SQL_COMMENT_PATTERN.sub(" ", query).strip().rstrip(";").strip()
+
+    if not cleaned:
+        raise SQLSafetyError("SQL 去除注释后为空")
+
+    # 多条语句（stacked queries）一律拒绝，防止 SELECT 后面藏一条写操作
+    if ";" in cleaned:
+        raise SQLSafetyError("禁止一次执行多条 SQL 语句")
+
+    if not _READONLY_SQL_START_PATTERN.match(cleaned):
+        raise SQLSafetyError(
+            f"仅允许只读查询（SELECT/SHOW/DESCRIBE/EXPLAIN），当前语句被拒绝"
+        )
+
+    if _FORBIDDEN_SQL_KEYWORD_PATTERN.search(cleaned):
+        raise SQLSafetyError("SQL 中包含写操作或危险关键字，已拒绝执行")
+
+    return cleaned
+
+
+def validate_table_name(table_name: str) -> str:
+    """
+    校验并返回安全的表名
+
+    :param table_name: 模型传入的表名
+    :return: 通过白名单校验的表名
+    :raises SQLSafetyError: 表名含非法字符或超长
+    """
+    if not table_name or not _TABLE_NAME_PATTERN.match(str(table_name)):
+        raise SQLSafetyError(
+            f"非法表名: {table_name!r}，仅允许字母、数字和下划线"
+        )
+    return str(table_name)
 
 
 # 集中读取数据库配置，后续三个工具都复用这份连接参数
@@ -122,12 +206,17 @@ def get_table_data(table_name) -> str:
     # 获取数据库参数
     config = get_db_config()
 
+    # 表名先过白名单校验，再配合反引号包裹，杜绝通过表名注入 SQL
+    try:
+        safe_table = validate_table_name(table_name)
+    except SQLSafetyError as e:
+        return str(e)
+
     # 查询流程同样是：连接 -> cursor -> 执行 SQL -> 获取列信息和数据 -> 自动释放资源
     try:
         with connect(**config) as conn:
             with conn.cursor() as cursor:
-                # 教程代码直接拼接表名，重点演示 Agent 查询链路；生产环境应改为白名单校验
-                sql = f"SELECT * FROM {table_name} LIMIT 100"
+                sql = f"SELECT * FROM `{safe_table}` LIMIT 100"
                 cursor.execute(sql)
 
                 # cursor.description 保存查询结果的列元信息
@@ -185,13 +274,18 @@ def execute_sql_query(query) -> str:
     # 获取数据库参数
     config = get_db_config()
 
+    # 只读防护：剥离注释后校验语句形式，不通过则直接拒绝，不建立数据库连接
+    try:
+        safe_query = assert_readonly_sql(query)
+    except SQLSafetyError as e:
+        return str(e)
+
     # 自定义查询和 get_table_data 的结果处理逻辑一致：
     # 执行 SQL -> 读取 description 得到列名 -> fetchall 得到数据 -> 拼成 CSV 返回
     try:
         with connect(**config) as conn:
             with conn.cursor() as cursor:
-                # 当前章节依赖提示词约束模型生成只读查询；生产环境建议在工具层限制 SELECT/SHOW
-                cursor.execute(query)
+                cursor.execute(safe_query)
 
                 # 非查询类 SQL 没有结果集描述，这里统一返回提示，避免工具调用直接抛错给模型
                 description = cursor.description

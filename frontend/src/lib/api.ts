@@ -56,14 +56,15 @@ export async function uploadSessionFiles(
   });
 }
 
-export async function listSessionFiles(path: string): Promise<FileListResponse> {
+export async function listSessionFiles(threadId: string): Promise<FileListResponse> {
   const url = new URL(apiUrl("/api/files"));
-  url.searchParams.set("path", path);
+  url.searchParams.set("thread_id", threadId);
   return requestJson<FileListResponse>(url);
 }
 
-export function getDownloadUrl(path: string): string {
+export function getDownloadUrl(threadId: string, path: string): string {
   const url = new URL(apiUrl("/api/download"));
+  url.searchParams.set("thread_id", threadId);
   url.searchParams.set("path", path);
   return url.toString();
 }

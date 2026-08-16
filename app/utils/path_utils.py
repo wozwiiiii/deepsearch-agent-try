@@ -1,8 +1,13 @@
 """
 文件路径解析工具
 
-负责把模型或工具返回的虚拟路径、上传文件路径和相对路径统一转换为本地绝对路径
-后续文件读取、Markdown 生成和 PDF 转换工具都可以复用这里的解析规则
+负责把模型或工具返回的虚拟路径、上传文件路径和相对路径统一转换为本地绝对路径。
+安全契约（生产化改造后）：
+
+1. 所有解析结果必须落在当前 session_dir 内，越界路径一律抛出 PathEscapeError；
+2. 绝对路径（含 Windows 盘符路径和 / 开头的 Unix 路径）不再放行，模型必须使用
+   会话目录内的相对路径，报错信息会引导模型自我纠正；
+3. 不再存在绕过会话约束的 `updated/` 特例分支，历史路径统一折叠为文件名。
 """
 
 import os
@@ -10,76 +15,82 @@ from pathlib import Path
 from typing import Optional
 
 
+class PathEscapeError(ValueError):
+    """路径尝试逃出会话目录或使用被禁止的路径形式时抛出"""
+
+    def __init__(self, filename: str, reason: str):
+        self.filename = filename
+        super().__init__(
+            f"路径被拒绝: {filename}（{reason}）。"
+            f"请只使用当前工作目录内的相对路径，例如 'report.md'。"
+        )
+
+
+# 大模型常返回 /workspace、/mnt/data 这类虚拟沙箱前缀，解析前统一剥离
+ALLOWED_VIRTUAL_PREFIXES = ("/workspace", "/mnt/data", "/home/user")
+
+
 def resolve_path(filename: str, session_dir: Optional[str] = None) -> str:
     """
-    解析文件路径，并尽量把任务产物限制在当前会话目录中
+    解析文件路径，并把结果强制限制在当前会话目录中
 
     :param filename: 模型、工具或用户传入的文件名/路径
-    :param session_dir: 当前任务的会话目录
-    :return: 解析后的绝对路径
+    :param session_dir: 当前任务的会话目录；提供时强制收容校验
+    :return: 解析后的绝对路径，保证位于 session_dir 内
+    :raises PathEscapeError: 路径为空、使用绝对路径或尝试逃出会话目录
     """
-    path = Path(filename)
-    path_str = filename.replace("\\", "/")
+    raw = filename if isinstance(filename, str) else str(filename)
+    path_str = raw.replace("\\", "/").strip()
 
-    # 大模型常返回 /workspace、/mnt/data 这类沙箱路径，本地项目需要先剥离虚拟前缀
-    for prefix in ["/workspace", "/mnt/data", "/home/user"]:
-        if path_str.startswith(prefix):
-            cleaned = path_str[len(prefix) :].lstrip("/")
-            path = Path(cleaned)
-            path_str = str(path).replace("\\", "/")
+    if not path_str or path_str == "/":
+        raise PathEscapeError(raw, "文件名不能为空")
+
+    # 剥离大模型常见的虚拟沙箱前缀，例如 /workspace/report.md -> report.md
+    for prefix in ALLOWED_VIRTUAL_PREFIXES:
+        if path_str.startswith(prefix + "/"):
+            path_str = path_str[len(prefix) + 1 :]
             break
 
-    # updated/ 用于存放用户上传文件，应优先按项目根目录下的真实上传路径解析
+    # 历史版本允许 updated/ 前缀指向真实上传目录，这会绕过会话约束；
+    # 现在上传文件在任务启动时已复制进 session_dir，这里统一折叠为文件名
     if "updated/" in path_str:
-        idx = path_str.find("updated/")
-        relative_part = path_str[idx:]
-        return str(Path(relative_part).resolve())
+        path_str = path_str.split("updated/")[-1].split("/")[-1]
 
-    if not session_dir:
-        return str(path.resolve())
+    if not path_str or path_str == "/":
+        raise PathEscapeError(raw, "剥离前缀后文件名为空")
+
+    if session_dir is None:
+        # 无会话上下文的本地脚本调试场景：只允许相对路径
+        if os.name == "nt" and Path(path_str).is_absolute():
+            raise PathEscapeError(raw, "无会话上下文时禁止使用绝对路径")
+        return str(Path(path_str).resolve())
 
     session_path = Path(session_dir).resolve()
-    session_name = session_path.name
-    is_unix_abs = path_str.startswith("/")
 
-    if path.is_absolute() or (os.name == "nt" and is_unix_abs):
-        # Windows 下 "/xxx" 没有盘符，按会话目录内的相对路径处理
-        if os.name == "nt" and is_unix_abs and not path.drive:
-            full_path = session_path / path_str.lstrip("/")
-        else:
-            full_path = path.resolve()
+    if Path(path_str).is_absolute():
+        # 绝对路径一律拒绝：即使指向会话目录内部也要求改用相对形式，
+        # 避免 Windows/Unix 路径差异导致的校验绕过
+        raise PathEscapeError(raw, "禁止使用绝对路径")
 
-        try:
-            if session_path in full_path.parents or full_path == session_path:
-                return _fix_nested_session_path(full_path, session_path, session_name)
-        except Exception:
-            pass
+    resolved = (session_path / path_str).resolve()
 
-        # 真实绝对路径且不在 session_dir 中时保持原样，避免误改外部资源路径
-        return str(full_path)
+    if not resolved.is_relative_to(session_path):
+        # resolve 会展开 ../ 等间接形式，这里统一做收容校验
+        raise PathEscapeError(raw, "路径越出会话目录")
 
-    parts = path.parts
-
-    # 避免模型把 session 名或 output 前缀重复拼到当前会话目录里
-    if session_name in parts:
-        return str(session_path / path.name)
-
-    if parts and parts[0] == "output":
-        return str(session_path / path.name)
-
-    return str(session_path / path)
+    return str(_flatten_redundant_prefix(resolved, session_path))
 
 
-def _fix_nested_session_path(
-    full_path: Path,
-    session_path: Path,
-    session_name: str,
-) -> str:
+def _flatten_redundant_prefix(full_path: Path, session_path: Path) -> Path:
     """
-    修正 session_xxx/session_xxx/file.md 这类重复嵌套路径
+    压平模型误拼的冗余目录层级
+
+    模型偶尔会生成 output/session_xxx/xxx.md 或 session_xxx/session_xxx/xxx.md
+    这类把会话目录名或 output 前缀重复拼进相对路径的写法；这里把中间的
+    冗余层级去掉，只保留最深层的子目录和文件名结构。
     """
-    parts = full_path.parts
-    for index in range(len(parts) - 1):
-        if parts[index] == session_name and parts[index + 1] == session_name:
-            return str(session_path / full_path.name)
-    return str(full_path)
+    rel_parts = full_path.relative_to(session_path).parts
+    redundant = {session_path.name, "output", "updated"}
+    if len(rel_parts) > 1 and any(part in redundant for part in rel_parts[:-1]):
+        return session_path / rel_parts[-1]
+    return full_path

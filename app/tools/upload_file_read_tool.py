@@ -13,7 +13,7 @@ from langchain_core.tools import tool
 
 from app.api.context import get_session_context
 from app.api.monitor import monitor
-from app.utils.path_utils import resolve_path
+from app.utils.path_utils import PathEscapeError, resolve_path
 
 # 文档解析依赖按需导入：缺少某类依赖时，只影响对应文件格式，不影响工具整体注册
 try:
@@ -53,9 +53,13 @@ def read_file_content(
         "文件内容读取工具", {"filename": filename, "instruction": instruction}
     )
 
-    # 解析路径时优先约束在当前 session_dir 内，避免模型传入绝对路径导致越界读取
+    # 解析路径时强制收容在当前 session_dir 内；越界路径返回错误文本，
+    # 让模型改用工作目录内的相对路径重试，而不是中断 Agent 执行链路
     session_dir = get_session_context()
-    file_path = Path(resolve_path(filename, session_dir))
+    try:
+        file_path = Path(resolve_path(filename, session_dir))
+    except PathEscapeError as e:
+        return str(e)
 
     if not file_path.exists():
         return f"错误：文件 '{filename}' 不存在 (解析路径: {file_path})。"

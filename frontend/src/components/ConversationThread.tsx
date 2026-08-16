@@ -252,7 +252,7 @@ function ArtifactShelf({ files }: { files: OutputFile[] }) {
             <Button
               aria-label={`下载 ${file.name}`}
               className="artifact-download"
-              href={getDownloadUrl(file.path)}
+              href={getDownloadUrl(file.thread_id, file.path)}
               icon={<DownloadOutlined />}
               shape="circle"
             />

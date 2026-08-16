@@ -66,12 +66,13 @@ export function useDeepAgentSession() {
       return;
     }
 
-    const response = await listSessionFiles(sessionPath);
+    // 文件列表按 thread_id 在服务端定位会话目录，前端不再传递本地绝对路径
+    const response = await listSessionFiles(threadId);
     if (response.error) {
       throw new Error(response.error);
     }
     setFiles(response.files || []);
-  }, [sessionPath]);
+  }, [sessionPath, threadId]);
 
   useEffect(() => {
     let disposed = false;

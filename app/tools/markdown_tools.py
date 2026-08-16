@@ -15,7 +15,7 @@ from langchain_core.tools import tool
 
 from app.api.context import get_session_context
 from app.api.monitor import monitor
-from app.utils.path_utils import resolve_path
+from app.utils.path_utils import PathEscapeError, resolve_path
 
 
 @tool
@@ -41,12 +41,16 @@ def generate_markdown(
     session_dir = get_session_context()
     print(f"[MarkdownTool] 当前会话目录: {session_dir}")
 
-    # 先把模型传入的 path/filename 合成一个逻辑路径，再交给 resolve_path 做统一清洗
+    # 先把模型传入的 path/filename 合成一个逻辑路径，再交给 resolve_path 做统一清洗；
+    # 越界路径返回错误文本引导模型改用相对路径重试，而不是把异常抛进 Agent 循环
     if path and path != ".":
         full_input_path = str(Path(path) / filename)
     else:
         full_input_path = filename
-    full_path_str = resolve_path(full_input_path, session_dir)
+    try:
+        full_path_str = resolve_path(full_input_path, session_dir)
+    except PathEscapeError as e:
+        return str(e)
     file_path = Path(full_path_str)
 
     parent_dir = file_path.parent

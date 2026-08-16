@@ -43,7 +43,10 @@ export interface UploadResponse {
 export interface OutputFile {
   name: string;
   type: "file" | string;
+  /** 会话目录内的相对路径，下载时与 thread_id 一起使用 */
   path: string;
+  /** 文件所属会话，下载接口据此在服务端定位会话目录 */
+  thread_id: string;
   size: number;
   mtime: number;
 }

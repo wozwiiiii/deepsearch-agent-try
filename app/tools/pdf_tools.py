@@ -17,7 +17,7 @@ from langchain_core.tools import tool
 
 from app.api.context import get_session_context
 from app.api.monitor import monitor
-from app.utils.path_utils import resolve_path
+from app.utils.path_utils import PathEscapeError, resolve_path
 from app.utils.word_converter import convert_md_to_pdf as convert_md_to_pdf_via_word
 
 
@@ -38,10 +38,13 @@ def convert_md_to_pdf(
     monitor.report_tool("Markdown转PDF工具")
 
     try:
-        # 输入路径必须先落到当前会话目录，避免模型传入任意系统路径
+        # 输入路径必须先落到当前会话目录；越界路径返回错误文本引导模型重试
         session_dir = get_session_context()
         md_path = Path(md_filename).with_suffix(".md")
-        md_abs_path = Path(resolve_path(str(md_path), session_dir))
+        try:
+            md_abs_path = Path(resolve_path(str(md_path), session_dir))
+        except PathEscapeError as e:
+            return str(e)
 
         if not md_abs_path.exists():
             return f"错误：文件不存在 {md_abs_path}"
@@ -49,7 +52,10 @@ def convert_md_to_pdf(
         # 未指定 PDF 文件名时，默认与源 Markdown 同目录同名
         if pdf_filename:
             pdf_path = Path(pdf_filename).with_suffix(".pdf")
-            pdf_abs_path = Path(resolve_path(str(pdf_path), session_dir))
+            try:
+                pdf_abs_path = Path(resolve_path(str(pdf_path), session_dir))
+            except PathEscapeError as e:
+                return str(e)
         else:
             pdf_abs_path = md_abs_path.with_suffix(".pdf")
 
