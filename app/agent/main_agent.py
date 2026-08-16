@@ -3,15 +3,25 @@
 
 负责把模型、主提示词、文件类工具和三个专家子智能体组装成 DeepAgent，
 并提供 run_deep_agent 作为后续 API 层调用的统一入口。运行时还会为每个
-session_id 创建独立工作目录，并把工具调用、子智能体调用和最终结果推送给前端。
+「租户 + session_id」创建独立工作目录，并把工具调用、子智能体调用和最终
+结果推送给前端。
+
+生产化改造（第二批）：
+1. 会话目录按租户隔离：output/user_{uid}/session_{sid}、updated 同构；
+2. checkpointer 由 InMemorySaver（重启即丢、多副本不共享）替换为
+   AsyncSqliteSaver 持久化到本地 SQLite（CHECKPOINT_DB 可配），服务重启后
+   同一 thread 可恢复历史状态；
+3. LangGraph thread_id 与 WebSocket 路由键统一为 "{user_id}-{session_id}"
+   复合键，租户间状态与事件互不可见。
 """
 
 import asyncio
+import os
 import shutil
 from pathlib import Path
 
 from deepagents import create_deep_agent
-from langgraph.checkpoint.memory import InMemorySaver
+from langgraph.checkpoint.sqlite.aio import AsyncSqliteSaver
 
 from app.agent.llm import model
 from app.agent.prompts import main_agent_content
@@ -30,35 +40,79 @@ from app.tools.markdown_tools import generate_markdown
 from app.tools.pdf_tools import convert_md_to_pdf
 from app.tools.upload_file_read_tool import read_file_content
 
-# 主智能体是调度中心：
-# 1. tools 只放最终交付相关的文件工具
-# 2. subagents 放网络、数据库、RAGFlow 三类信息获取助手
-# 3. checkpointer 通过 thread_id 保存同一会话中的执行上下文
-main_agent = create_deep_agent(
-    model=model,
-    system_prompt=main_agent_content["system_prompt"],
-    tools=[generate_markdown, convert_md_to_pdf, read_file_content],
-    checkpointer=InMemorySaver(),
-    subagents=[database_query_agent, network_search_agent, knowledge_base_agent],
-)
-
 # 当前文件位于 app/agent/main_agent.py，parents[1] 即 app 目录
 project_root_path = Path(__file__).parents[1].resolve()
 
+# 检查点数据库路径：默认 app/data/checkpoints.sqlite3，可用 CHECKPOINT_DB 覆盖
+CHECKPOINT_DB = os.getenv(
+    "CHECKPOINT_DB", str(project_root_path / "data" / "checkpoints.sqlite3")
+)
 
-async def run_deep_agent(task_query, session_id):
+# 主智能体是调度中心：
+# 1. tools 只放最终交付相关的文件工具
+# 2. subagents 放网络、数据库、RAGFlow 三类信息获取助手
+# 3. checkpointer 依赖复合 thread_id 保存同一会话的执行上下文
+#
+# 惰性初始化：AsyncSqliteSaver 需要持有长连接，首次执行任务时再创建并复用，
+# 避免模块导入（例如测试收集）就建立数据库连接
+_main_agent = None
+_agent_init_lock = asyncio.Lock()
+_checkpoint_saver = None
+
+
+async def _get_agent():
+    """
+    返回可复用的主智能体实例，首次调用时完成组装和持久化 checkpointer 初始化
+    """
+    global _main_agent, _checkpoint_saver
+    if _main_agent is not None:
+        return _main_agent
+
+    async with _agent_init_lock:
+        if _main_agent is not None:
+            return _main_agent
+
+        db_path = Path(CHECKPOINT_DB)
+        db_path.parent.mkdir(parents=True, exist_ok=True)
+
+        # from_conn_string 返回异步上下文管理器；这里显式进入并保持到进程结束，
+        # 连接随进程退出由操作系统回收（SQLite WAL 下中断是安全的）
+        saver_ctx = AsyncSqliteSaver.from_conn_string(str(db_path))
+        _checkpoint_saver = await saver_ctx.__aenter__()
+
+        _main_agent = create_deep_agent(
+            model=model,
+            system_prompt=main_agent_content["system_prompt"],
+            tools=[generate_markdown, convert_md_to_pdf, read_file_content],
+            checkpointer=_checkpoint_saver,
+            subagents=[
+                database_query_agent,
+                network_search_agent,
+                knowledge_base_agent,
+            ],
+        )
+        print(f"[MainAgent] 已初始化，checkpointer=sqlite:{db_path}")
+        return _main_agent
+
+
+async def run_deep_agent(task_query, session_id, user_id="local"):
     """
     异步流式执行主智能体
 
-    API 层会为每次任务传入用户问题和 session_id。本函数负责准备会话目录、
-    复制上传文件、写入 ContextVar，并在流式执行过程中把关键事件上报给前端。
+    API 层会为每次任务传入用户问题、session_id 和租户 user_id。本函数负责
+    准备租户隔离的会话目录、复制上传文件、写入 ContextVar，并在流式执行
+    过程中把关键事件上报给前端。
     :param task_query: 前端提交的原始任务问题
-    :param session_id: 当前任务 ID，同时用于 thread_id、输出目录和 WebSocket 定向推送
+    :param session_id: 当前任务 ID，同时用于输出目录和 WebSocket 定向推送
+    :param user_id: 租户身份，目录、checkpointer 和推送路由都按其隔离
     """
-    print(f"[MainAgent] 开始执行会话，session_id={session_id}")
+    print(f"[MainAgent] 开始执行会话，user_id={user_id}，session_id={session_id}")
 
-    # 每个会话独立使用 output/session_{session_id}，避免不同用户的产物互相覆盖
-    session_dir = project_root_path / "output" / f"session_{session_id}"
+    # 每个租户每个会话独立使用 output/user_{uid}/session_{session_id}，
+    # 避免不同用户的产物互相覆盖或互访
+    session_dir = (
+        project_root_path / "output" / f"user_{user_id}" / f"session_{session_id}"
+    )
     session_dir.mkdir(parents=True, exist_ok=True)
 
     # 前端和工具使用绝对路径；提示词里只给模型相对路径，降低模型误用系统绝对路径的概率
@@ -67,9 +121,11 @@ async def run_deep_agent(task_query, session_id):
         "\\", "/"
     )
 
-    # 上传文件先落在 updated/session_{session_id}，执行前复制到本次 output 工作目录
+    # 上传文件先落在 updated/user_{uid}/session_{session_id}，执行前复制到本次 output 工作目录
     # 这样读文件工具和生成文件工具都只需要围绕同一个 session_dir 工作
-    updated_dir_path = project_root_path / "updated" / f"session_{session_id}"
+    updated_dir_path = (
+        project_root_path / "updated" / f"user_{user_id}" / f"session_{session_id}"
+    )
     updated_info_prompt = ""
     if updated_dir_path.exists():
         files = [f.name for f in updated_dir_path.iterdir() if f.is_file()]
@@ -85,15 +141,19 @@ async def run_deep_agent(task_query, session_id):
                 + "\n    请优先使用工具（read_file_content）读取并参考这些文件。"
             )
 
-    # ContextVar 让深层工具无需显式传参，也能拿到当前会话目录和 WebSocket thread_id
+    # 复合键与 server.composite_task_key 保持一致：
+    # 1. WebSocket 按它路由 monitor 事件；2. LangGraph 按它隔离租户状态
+    routing_key = f"{user_id}-{session_id}"
+
+    # ContextVar 让深层工具无需显式传参，也能拿到当前会话目录和 WebSocket 路由键
     session_dir_token = set_session_context(session_dir_str)
-    session_id_token = set_thread_context(session_id)
+    session_id_token = set_thread_context(routing_key)
 
     # 前端拿到工作目录后，可以展示本次任务生成的 Markdown/PDF 等产物
     monitor.report_session_dir(session_dir_str)
 
-    # checkpointer 依赖 thread_id 区分会话记忆；同一 session_id 会复用同一条执行上下文
-    config = {"configurable": {"thread_id": session_id}}
+    # checkpointer 依赖 thread_id 区分会话记忆；复合键保证租户间状态隔离
+    config = {"configurable": {"thread_id": routing_key}}
 
     # 工作环境指令是运行时动态补充的，约束模型只在当前会话目录读写文件
     path_instruction = f"""
@@ -109,8 +169,11 @@ async def run_deep_agent(task_query, session_id):
     """
 
     try:
+        # 首次调用会完成 Agent 组装和 SQLite checkpointer 初始化
+        agent = await _get_agent()
+
         # astream 会持续产出模型节点、工具节点和子智能体节点的状态片段
-        async for chunk in main_agent.astream(
+        async for chunk in agent.astream(
             {"messages": [{"role": "user", "content": task_query + path_instruction}]},
             config=config,
         ):
@@ -157,5 +220,9 @@ if __name__ == "__main__":
     import asyncio
 
     asyncio.run(
-        run_deep_agent("从网络查询机器人信息，并生成Markdown文件", "test_session_001")
+        run_deep_agent(
+            "从网络查询机器人信息，并生成Markdown文件",
+            "test_session_001",
+            user_id="local",
+        )
     )

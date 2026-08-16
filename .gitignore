@@ -5,6 +5,7 @@
 /tmp
 app/output
 app/updated
+app/data
 /out-tsc
 # Only exists if Bazel was run
 /bazel-out

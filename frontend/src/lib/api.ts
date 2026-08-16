@@ -1,4 +1,4 @@
-import { API_BASE_URL } from "./config";
+import { API_BASE_URL, API_KEY } from "./config";
 import type { CancelTaskResponse, FileListResponse, TaskResponse, UploadResponse } from "../types";
 
 function apiUrl(path: string): string {
@@ -6,7 +6,11 @@ function apiUrl(path: string): string {
 }
 
 async function requestJson<T>(input: RequestInfo | URL, init?: RequestInit): Promise<T> {
-  const response = await fetch(input, init);
+  const headers = new Headers(init?.headers);
+  if (API_KEY && !headers.has("X-API-Key")) {
+    headers.set("X-API-Key", API_KEY);
+  }
+  const response = await fetch(input, { ...init, headers });
   const contentType = response.headers.get("content-type") || "";
   const payload = contentType.includes("application/json")
     ? await response.json()
@@ -66,5 +70,9 @@ export function getDownloadUrl(threadId: string, path: string): string {
   const url = new URL(apiUrl("/api/download"));
   url.searchParams.set("thread_id", threadId);
   url.searchParams.set("path", path);
+  // 下载走浏览器直链无法自定义请求头，密钥经查询参数传递
+  if (API_KEY) {
+    url.searchParams.set("api_key", API_KEY);
+  }
   return url.toString();
 }

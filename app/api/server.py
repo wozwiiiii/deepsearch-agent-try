@@ -10,7 +10,9 @@ WebSocket 长连接。HTTP 接口只做轻量调度，真正的 DeepAgents 执�
 2. 上传接口增加扩展名白名单、单文件大小上限和文件名清洗，异步分块落盘；
 3. 文件列表/下载不再接受客户端传入的绝对路径，改为按 thread_id 在服务端
    拼接会话目录，天然消除跨会话越权浏览与下载；
-4. CORS 收敛为可配置白名单；错误统一返回正确的 HTTP 状态码。
+4. CORS 收敛为可配置白名单；错误统一返回正确的 HTTP 状态码；
+5. 全部业务接口经 X-API-Key 认证，会话目录/上传目录/任务取消/WebSocket
+   推送均按租户 user_id 隔离（app/api/auth.py）。
 """
 
 import asyncio
@@ -24,9 +26,11 @@ from typing import List
 import aiofiles
 import uvicorn
 from fastapi import (
+    Depends,
     FastAPI,
     File,
     Form,
+    Header,
     HTTPException,
     UploadFile,
     WebSocket,
@@ -37,15 +41,16 @@ from fastapi.responses import FileResponse
 from pydantic import BaseModel, Field
 
 from app.agent.main_agent import run_deep_agent
+from app.api.auth import Principal, authenticate_api_key, require_principal
 from app.api.monitor import manager
 
 # ---------------------------------------------------------------------------
 # 安全校验常量与工具函数
 # ---------------------------------------------------------------------------
 
-# thread_id 会拼进文件系统路径和 LangGraph 配置，只放行安全字符，
-# 服务端生成的 uuid4 天然满足该格式
-_THREAD_ID_PATTERN = re.compile(r"^[A-Za-z0-9_-]{1,64}$")
+# thread_id 会拼进文件系统路径和 LangGraph 配置，只放行安全字符。
+# 上限 48 位：与用户前缀拼成 "{user_id}-{thread_id}" 后不超过 64 位
+_THREAD_ID_PATTERN = re.compile(r"^[A-Za-z0-9_-]{1,48}$")
 
 # 上传文件扩展名白名单：与 read_file_content 工具支持的解析格式保持一致
 ALLOWED_UPLOAD_EXTENSIONS = {".md", ".txt", ".pdf", ".docx", ".xlsx", ".xls", ".csv"}
@@ -77,9 +82,41 @@ def validate_thread_id(thread_id: str) -> str:
     if not thread_id or not _THREAD_ID_PATTERN.match(thread_id):
         raise HTTPException(
             status_code=400,
-            detail="非法的 thread_id：仅允许 1-64 位字母、数字、下划线或连字符",
+            detail="非法的 thread_id：仅允许 1-48 位字母、数字、下划线或连字符",
         )
     return thread_id
+
+
+def user_scope_dir(base_dir: Path, user_id: str, thread_id: str) -> Path:
+    """
+    返回某个租户某次会话在 base_dir 下的工作目录
+
+    目录结构 base/user_{user_id}/session_{thread_id} 保证不同租户的产物
+    与上传文件在文件系统层面天然隔离。
+    """
+    return base_dir / f"user_{user_id}" / f"session_{thread_id}"
+
+
+def composite_task_key(user_id: str, thread_id: str) -> str:
+    """
+    生成任务级复合键：active_tasks、WebSocket 路由和 LangGraph thread_id
+    共用同一形式 "{user_id}-{thread_id}"，确保 A 用户无法取消/接收 B 用户的任务
+
+    user_id 限定为纯小写字母数字（见 auth.py），复合键因此无歧义。
+    """
+    return f"{user_id}-{thread_id}"
+
+
+async def require_principal_for_link(
+    x_api_key: str | None = Header(default=None, alias="X-API-Key"),
+    api_key: str | None = None,
+) -> Principal:
+    """
+    浏览器直链（下载、WebSocket）无法自定义请求头时的认证依赖：
+    优先 X-API-Key 请求头，缺省时回退 api_key 查询参数。
+    查询参数形式的密钥可能出现在访问日志中，属已知取舍（见 PRODUCTION_NOTES）。
+    """
+    return authenticate_api_key(x_api_key or api_key)
 
 
 def sanitize_filename(filename: str) -> str:
@@ -96,11 +133,6 @@ def sanitize_filename(filename: str) -> str:
     if "/" in safe_name or "\\" in safe_name or "\x00" in safe_name:
         raise HTTPException(status_code=400, detail="非法的文件名")
     return safe_name
-
-
-def session_output_dir(thread_id: str) -> Path:
-    """返回指定会话的输出目录，调用方需先通过 validate_thread_id 校验"""
-    return output_dir / f"session_{thread_id}"
 
 
 @asynccontextmanager
@@ -170,7 +202,7 @@ async def health():
 
 
 @app.post("/api/task")
-async def run_task(request: TaskRequest):
+async def run_task(request: TaskRequest, principal: Principal = Depends(require_principal)):
     """
     启动一次 DeepAgents 后台任务。
 
@@ -178,22 +210,25 @@ async def run_task(request: TaskRequest):
     答案都会由 monitor 通过 `/ws/{thread_id}` 推送给同一会话的前端。
     """
     thread_id = validate_thread_id(request.thread_id or str(uuid.uuid4()))
+    task_key = composite_task_key(principal.user_id, thread_id)
 
-    # 同一个 thread_id 只保留一个活跃任务，新任务会先取消旧任务，避免并发写同一会话目录
-    old_task = active_tasks.get(thread_id)
+    # 同一用户同一 thread_id 只保留一个活跃任务；复合键保证跨租户互不影响
+    old_task = active_tasks.get(task_key)
     if old_task and not old_task.done():
         old_task.cancel()
 
     # create_task 把长耗时 Agent 执行交给事件循环，接口本身不用等待最终结果
-    task = asyncio.create_task(run_deep_agent(request.query, thread_id))
-    active_tasks[thread_id] = task
-    task.add_done_callback(lambda finished_task: _forget_task(thread_id, finished_task))
+    task = asyncio.create_task(
+        run_deep_agent(request.query, thread_id, principal.user_id)
+    )
+    active_tasks[task_key] = task
+    task.add_done_callback(lambda finished_task: _forget_task(task_key, finished_task))
 
     return {"status": "started", "thread_id": thread_id}
 
 
 @app.post("/api/task/{thread_id}/cancel")
-async def cancel_task(thread_id: str):
+async def cancel_task(thread_id: str, principal: Principal = Depends(require_principal)):
     """
     取消指定 thread_id 对应的后台 Agent 任务。
 
@@ -201,9 +236,10 @@ async def cancel_task(thread_id: str):
     的同步阻塞调用，任务可能需要等该调用返回后才会真正结束。
     """
     validate_thread_id(thread_id)
-    task = active_tasks.get(thread_id)
+    task_key = composite_task_key(principal.user_id, thread_id)
+    task = active_tasks.get(task_key)
     if not task or task.done():
-        active_tasks.pop(thread_id, None)
+        active_tasks.pop(task_key, None)
         raise HTTPException(status_code=404, detail="任务不存在或已结束")
 
     # 先发出取消信号，再短暂等待协程响应；若底层阻塞中，则返回 cancelling 给前端继续展示状态
@@ -211,26 +247,30 @@ async def cancel_task(thread_id: str):
     try:
         await asyncio.wait_for(task, timeout=1.0)
     except asyncio.CancelledError:
-        _forget_task(thread_id, task)
+        _forget_task(task_key, task)
         return {"status": "cancelled", "thread_id": thread_id}
     except asyncio.TimeoutError:
         return {"status": "cancelling", "thread_id": thread_id}
     except Exception as e:
-        _forget_task(thread_id, task)
+        _forget_task(task_key, task)
         return {"status": "cancelled", "thread_id": thread_id, "message": str(e)}
 
-    _forget_task(thread_id, task)
+    _forget_task(task_key, task)
     return {"status": "cancelled", "thread_id": thread_id}
 
 
 @app.post("/api/upload")
-async def upload_files(files: List[UploadFile] = File(...), thread_id: str = Form(...)):
+async def upload_files(
+    files: List[UploadFile] = File(...),
+    thread_id: str = Form(...),
+    principal: Principal = Depends(require_principal),
+):
     """
     文件上传接口 (File Upload)。
 
     目标：
     1. 接收用户上传的一个或多个文件，校验扩展名白名单和大小上限。
-    2. 清洗文件名后保存到 `updated/session_{thread_id}` 目录。
+    2. 清洗文件名后保存到当前租户的 `updated/user_{uid}/session_{thread_id}` 目录。
     3. 供 Agent 在后续任务中读取和分析。
 
     Args:
@@ -239,8 +279,8 @@ async def upload_files(files: List[UploadFile] = File(...), thread_id: str = For
     """
     validate_thread_id(thread_id)
 
-    # 上传文件先按会话隔离保存，避免不同任务读取到彼此的附件
-    target_dir = updated_dir / f"session_{thread_id}"
+    # 上传文件按「租户 + 会话」两级隔离保存，避免不同用户读取到彼此的附件
+    target_dir = user_scope_dir(updated_dir, principal.user_id, thread_id)
     target_dir.mkdir(parents=True, exist_ok=True)
 
     saved_files = []
@@ -281,19 +321,19 @@ async def upload_files(files: List[UploadFile] = File(...), thread_id: str = For
 
 
 @app.get("/api/files")
-async def list_files(thread_id: str):
+async def list_files(thread_id: str, principal: Principal = Depends(require_principal)):
     """
     文件列表查询接口 (File Explorer)。
 
-    只接受 thread_id，由服务端拼接对应的会话输出目录；客户端无法指定任意
-    路径，因此不存在跨会话枚举其他用户产物的可能。返回的 path 为会话目录
-    内的相对路径，供下载接口使用。
+    只接受 thread_id，由服务端拼接当前租户的会话输出目录；客户端无法指定任意
+    路径，也无法看到其他租户的任何产物。返回的 path 为会话目录内的相对路径，
+    供下载接口使用。
 
     Args:
         thread_id (str): 会话 ID。
     """
     validate_thread_id(thread_id)
-    session_dir = session_output_dir(thread_id)
+    session_dir = user_scope_dir(output_dir, principal.user_id, thread_id)
 
     if not session_dir.exists():
         raise HTTPException(status_code=404, detail="会话目录不存在")
@@ -324,20 +364,24 @@ async def list_files(thread_id: str):
 
 
 @app.get("/api/download")
-async def download_file(thread_id: str, path: str):
+async def download_file(
+    thread_id: str,
+    path: str,
+    principal: Principal = Depends(require_principal_for_link),
+):
     """
     文件下载接口 (File Download)。
 
-    下载范围由服务端根据 thread_id 决定（output/session_{thread_id}），path
-    参数只允许是会话目录内的相对路径；resolve 后再做一次收容校验，双保险
-    阻断 ../ 形式的路径穿越。
+    下载范围由服务端根据「当前租户 + thread_id」决定，path 参数只允许是
+    会话目录内的相对路径；resolve 后再做一次收容校验，双保险阻断 ../ 形式
+    的路径穿越。其他租户即使传入相同 thread_id 也只会定位到自己的目录。
 
     Args:
         thread_id (str): 会话 ID。
         path (str): 会话目录内的相对路径（来自 /api/files 返回值）。
     """
     validate_thread_id(thread_id)
-    session_dir = session_output_dir(thread_id).resolve()
+    session_dir = user_scope_dir(output_dir, principal.user_id, thread_id).resolve()
 
     abs_path = (session_dir / path).resolve()
     if not abs_path.is_relative_to(session_dir):
@@ -355,14 +399,24 @@ async def websocket_endpoint(websocket: WebSocket, thread_id: str):
     """
     WebSocket 实时通讯核心接口 (Real-time Communication)。
 
-    连接建立后，ConnectionManager 会用 thread_id 保存 WebSocket。monitor 后续
-    发送事件时只需要按 thread_id 查找连接，就能把进度推给对应页面。循环中的
-    receive_text 用于接收前端心跳，避免连接空闲断开。
+    浏览器 WebSocket 无法自定义请求头，因此鉴权密钥经查询参数 api_key 传递；
+    该形式的密钥可能出现在访问日志中，属已知取舍（详见 PRODUCTION_NOTES）。
+    连接建立后按「租户+thread_id」复合键注册，monitor 事件按同一复合键定向
+    推送，保证不同租户即使使用相同 thread_id 也不会收到彼此的执行事件。
     """
-    validate_thread_id(thread_id)
+    # 浏览器无法为 WS 设置 X-API-Key 头，鉴权走查询参数
+    try:
+        principal = authenticate_api_key(websocket.query_params.get("api_key"))
+    except HTTPException:
+        # 未 accept 直接 close，Starlette 会以 403 拒绝握手
+        await websocket.close(code=1008)
+        return
 
-    # 连接建立后立即按 thread_id 注册，monitor 后续才能把事件定向推给当前页面
-    await manager.connect(websocket, thread_id)
+    validate_thread_id(thread_id)
+    routing_key = composite_task_key(principal.user_id, thread_id)
+
+    # 连接建立后立即按复合键注册，monitor 后续才能把事件定向推给当前页面
+    await manager.connect(websocket, routing_key)
 
     try:
         while True:
@@ -374,12 +428,12 @@ async def websocket_endpoint(websocket: WebSocket, thread_id: str):
 
     except WebSocketDisconnect:
         # 只移除当前 WebSocket 实例，避免旧连接断开时误删同 thread_id 的新连接
-        manager.disconnect(websocket, thread_id)
-        print(f"[WebSocket] 客户端已断开: {thread_id}")
+        manager.disconnect(websocket, routing_key)
+        print(f"[WebSocket] 客户端已断开: {routing_key}")
 
     except Exception as e:
         print(f"[WebSocket] 连接异常: {e}")
-        manager.disconnect(websocket, thread_id)
+        manager.disconnect(websocket, routing_key)
 
 
 if __name__ == "__main__":

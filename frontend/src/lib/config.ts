@@ -25,3 +25,6 @@ export const API_BASE_URL = stripTrailingSlash(
 );
 
 export const WS_BASE_URL = deriveWsBaseUrl(API_BASE_URL);
+
+// 后端配置了 API_KEYS 时需要携带密钥；本地开发模式（后端未配置）留空即可
+export const API_KEY = (import.meta.env.VITE_API_KEY as string | undefined)?.trim() ?? "";

@@ -20,7 +20,7 @@ from app.api import server
 
 @pytest.fixture
 def client(monkeypatch):
-    async def _noop_agent(query, thread_id):
+    async def _noop_agent(*args, **kwargs):
         return None
 
     monkeypatch.setattr(server, "run_deep_agent", _noop_agent)
@@ -86,9 +86,9 @@ class TestUploadSafety:
     def test_traversal_filename_sanitized_into_session_dir(self, client):
         response = self._upload(client, "../../evil.txt")
         assert response.status_code == 200
-        # 文件名被清洗为 basename，且没有越出 updated 目录
+        # 文件名被清洗为 basename，且落在当前租户（开发模式 local）目录内
         assert response.json()["files"] == ["evil.txt"]
-        stored = server.updated_dir / "session_tid_test" / "evil.txt"
+        stored = server.updated_dir / "user_local" / "session_tid_test" / "evil.txt"
         assert stored.exists()
         assert not (server.updated_dir.parent.parent / "evil.txt").exists()
 
@@ -111,12 +111,15 @@ class TestUploadSafety:
         response = self._upload(client, "big.txt", b"x" * 1024)
         assert response.status_code == 413
         # 超限的半成品文件必须被清理
-        assert not (server.updated_dir / "session_tid_test" / "big.txt").exists()
+        assert not (
+            server.updated_dir / "user_local" / "session_tid_test" / "big.txt"
+        ).exists()
 
 
 class TestFileIsolation:
     def _prepare_session(self, name="iso_test", filename="secret.md"):
-        session_dir = server.output_dir / f"session_{name}"
+        # 开发模式（未配置 API_KEYS）下所有请求归属 local 租户
+        session_dir = server.output_dir / "user_local" / f"session_{name}"
         session_dir.mkdir(parents=True, exist_ok=True)
         target = session_dir / filename
         target.write_text("机密内容", encoding="utf-8")
@@ -160,7 +163,7 @@ class TestFileIsolation:
     def test_download_other_session_file_rejected(self, client):
         # 会话 A 尝试通过相对路径读到会话 B 的产物必须被拒绝
         self._prepare_session(name="session_b", filename="b_secret.md")
-        session_a = server.output_dir / "session_session_a"
+        session_a = server.output_dir / "user_local" / "session_session_a"
         session_a.mkdir(parents=True, exist_ok=True)
         response = client.get(
             "/api/download",

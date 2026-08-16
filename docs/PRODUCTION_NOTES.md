@@ -1,9 +1,12 @@
 # 生产化改造笔记（Production Hardening Notes）
 
-> 本文档记录把教学版「深度研搜」向可上线系统推进的**第一批安全加固**：
+> 本文档记录把教学版「深度研搜」向可上线系统推进的改造过程：
 > 每一项都包含「原问题 → 风险 → 修复方式 → 验证方式」，并附尚未完成的企业级差距清单。
 > 原始教学代码来自 [didilili/deepsearch-agents](https://github.com/didilili/deepsearch-agents)，
 > 本仓库的增量改造以本文档为准，可作为代码评审和面试讲述的材料。
+>
+> - 第一批（安全加固）：路径穿越、SQL 只读、上传限制、横向越权、CORS 等 7 类问题
+> - 第二批（认证与状态）：API Key 认证 + 多租户隔离 + SQLite 持久化 checkpointer
 
 ## 一、已完成的修复
 
@@ -54,10 +57,42 @@
 
 `/api/files`、`/api/download` 改为 thread_id 驱动后，前端 `api.ts` / `useDeepAgentSession.ts` / `FileDock` / `ConversationThread` / `types.ts` 同步修改：文件列表返回会话内相对路径 + `thread_id`，下载时由服务端定位会话目录。`tsc -b` 类型检查通过。
 
-## 二、如何验证
+## 二、第二批：认证、多租户隔离与状态持久化
+
+### 5. API Key 认证（`app/api/auth.py` 新增）
+
+- **原问题**：所有接口无认证，任何知道地址的人都能启动任务（消耗 LLM API 费用）、上传文件、拉取产物。
+- **修复**：
+  - `API_KEYS=用户名:密钥` 环境变量配置租户密钥（密钥 ≥16 位，常数时间比较防时序侧信道）；
+  - 所有 `/api/*` 接口经 `X-API-Key` 请求头认证（FastAPI 依赖注入），错误密钥 401，配置格式错误 500；
+  - 浏览器直链（下载）与 WebSocket 无法自定义请求头，回退 `api_key` 查询参数（已知取舍：查询串可能进入访问日志）；
+  - 不配置 `API_KEYS` 时为本地开发模式（归属默认用户 `local`，不鉴权），保证教学场景零配置可用；`/health` 免鉴权供探活。
+- **验证**：`tests/test_auth.py`（密钥解析、401/500 行为、WS 握手拒绝）。
+
+### 6. 多租户隔离（server.py + main_agent.py）
+
+- **原问题**：会话目录、上传目录、任务表、WebSocket 推送全部只按 `thread_id` 区分。不同用户使用相同 thread_id 时：A 能列举下载 B 的产物、A 能取消 B 的任务、monitor 事件会推给错误的连接（租户间信息串台）。
+- **修复**：
+  - 认证后将每个请求绑定到 `Principal.user_id`；
+  - 目录结构改为 `output/user_{uid}/session_{tid}`、`updated/user_{uid}/session_{tid}`；
+  - `active_tasks`、WebSocket 路由、LangGraph thread_id 统一使用复合键 `{user_id}-{thread_id}`（user_id 限纯小写字母数字，保证复合键无歧义；thread_id 上限收到 48 位，复合后 ≤64）；
+  - 隔离由构造保证：文件接口的服务端路径拼接天然只落到当前租户目录，无需逐条授权判断。
+- **验证**：`tests/test_auth.py::TestTenantIsolation`（同 thread_id 跨租户 404、上传落位租户目录）。
+
+### 7. 会话状态持久化（main_agent.py）
+
+- **原问题**：`InMemorySaver` 作为 checkpointer——服务重启丢全部会话上下文，多副本部署状态不共享，"断点续聊"不存在。
+- **修复**：
+  - 替换为 `AsyncSqliteSaver`（`langgraph-checkpoint-sqlite`），持久化到 `CHECKPOINT_DB`（默认 `app/data/checkpoints.sqlite3`，已入 .gitignore）；
+  - Agent 改为**惰性初始化**（首次任务时建库建连接并缓存复用），避免模块导入即占连接；
+  - 服务重启后同一复合 thread_id 自动恢复历史消息与执行状态。
+- **验证**：`tests/test_checkpointer.py`（checkpoint 写入后由**新 saver 实例**（等价重启）读回；thread 间隔离；惰性初始化建库且缓存复用）。
+- **边界说明**：SQLite 适合单机部署；多副本水平扩容时换 `langgraph-checkpoint-postgres`，接口不变，只换 saver 实现。
+
+## 三、如何验证
 
 ```bash
-# 后端安全测试（76 个用例）
+# 后端全部测试（101 个用例：安全 + 认证/租户 + 持久化）
 uv sync --group dev
 uv run pytest tests/ -q
 
@@ -65,20 +100,19 @@ uv run pytest tests/ -q
 cd frontend && pnpm install && pnpm exec tsc -b
 ```
 
-## 三、尚未完成的企业级差距（下一步路线图）
+## 四、尚未完成的企业级差距（下一步路线图）
 
 以下按「上线阻塞性」排序，是诚实的能力边界，也是后续迭代计划：
 
-1. **认证与多租户（上线前必须）**：当前所有接口无认证。最小方案：API Key / JWT Bearer 认证中间件 + 按用户隔离会话目录（`output/{user_id}/session_{thread_id}`）+ 会话归属校验。涉及用户体系时对接 OIDC（企业常见 Authing / Casdoor / 自建）。
-2. **限流与成本控制（上线前必须）**：`slowapi` 按 IP/用户限流；DeepAgents 已有模型调用次数限制中间件（见 `examples/13-model-call-limit-middleware.py`），接入主 Agent；LLM 调用计入预算熔断。
-3. **状态持久化（上线前必须）**：`InMemorySaver` 重启丢会话、多副本不共享。替换为 `langgraph-checkpoint-postgres`（或 SQLite 起步）；`active_tasks` 进程内 dict 改 Redis 或任务表，否则多 worker 部署下取消接口直接失效。
-4. **任务队列与并发治理**：当前 `asyncio.create_task` 进程内执行，重启即丢、无法水平扩容。引入 Celery / ARQ / Temporal，Agent 执行与 API 进程分离。
-5. **可观测性**：`print` 全量替换为结构化日志（logging + JSON formatter），接入 OpenTelemetry trace（LangSmith / LangFuse 追踪 Agent 链路），Prometheus 指标（任务时长、工具失败率、LLM token 消耗）+ 告警。
-6. **评测体系**：固定评测集（20–50 个典型任务）+ LLM-as-judge 自动评分 + 检索质量（命中率/引用准确率）指标，接 CI 做回归。这是 Agent 项目区别于 demo 的核心证据。
-7. **CI/CD**：GitHub Actions（lint + pytest + tsc + build），pre-commit 已有配置需补齐 ruff/mypy 钩子；后端目前无 Dockerfile（只有 MySQL compose），需补多阶段构建镜像。
-8. **内容安全**：上传文件病毒扫描（ClamAV）、模型输出审核（涉政/敏感词）、提示注入防护（系统提示与用户输入隔离、工具结果标记为不可信数据）。
+1. **限流与成本控制（上线前必须）**：`slowapi` 按 IP/用户限流；DeepAgents 已有模型调用次数限制中间件（见 `examples/13-model-call-limit-middleware.py`），接入主 Agent；LLM 调用计入预算熔断。
+2. **任务队列与并发治理**：当前 `asyncio.create_task` 进程内执行，重启即丢、无法水平扩容；`active_tasks` 是进程内 dict，多 worker 部署下取消接口失效。引入 Celery / ARQ / Temporal，Agent 执行与 API 进程分离，任务状态入 Redis 或数据库。
+3. **可观测性**：`print` 全量替换为结构化日志（logging + JSON formatter），接入 OpenTelemetry trace（LangSmith / LangFuse 追踪 Agent 链路），Prometheus 指标（任务时长、工具失败率、LLM token 消耗）+ 告警。
+4. **评测体系**：固定评测集（20–50 个典型任务）+ LLM-as-judge 自动评分 + 检索质量（命中率/引用准确率）指标，接 CI 做回归。这是 Agent 项目区别于 demo 的核心证据。
+5. **CI/CD**：GitHub Actions（lint + pytest + tsc + build），pre-commit 已有配置需补齐 ruff/mypy 钩子；后端目前无 Dockerfile（只有 MySQL compose），需补多阶段构建镜像。
+6. **内容安全**：上传文件病毒扫描（ClamAV）、模型输出审核（涉政/敏感词）、提示注入防护（系统提示与用户输入隔离、工具结果标记为不可信数据）。
+7. **认证升级路径**：当前 API Key 适合个人/小团队部署；对外多用户产品需换 OIDC（Authing / Casdoor / Auth0）+ JWT，密钥轮换与吊销机制。
 
-## 四、与上游教学版的关系
+## 五、与上游教学版的关系
 
 本仓库基于开源教学项目 deepsearch-agents（MIT 协议）。简历与面试中的正确定位是：
 "基于开源教学项目做了**生产化安全改造**：修复路径穿越、SQL 任意执行、横向越权、

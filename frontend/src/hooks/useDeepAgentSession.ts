@@ -1,6 +1,6 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { cancelTask, listSessionFiles, startTask, uploadSessionFiles } from "../lib/api";
-import { WS_BASE_URL } from "../lib/config";
+import { API_KEY, WS_BASE_URL } from "../lib/config";
 import { createThreadId, getStoredThreadId, storeThreadId } from "../lib/thread";
 import type {
   ConnectionState,
@@ -83,7 +83,11 @@ export function useDeepAgentSession() {
       socketRef.current?.close();
       setConnectionState(hadSocket ? "reconnecting" : "connecting");
 
-      const socket = new WebSocket(`${WS_BASE_URL}/ws/${encodeURIComponent(threadId)}`);
+      // 浏览器 WS 无法自定义请求头，鉴权密钥经查询参数传递
+      const wsUrl = API_KEY
+        ? `${WS_BASE_URL}/ws/${encodeURIComponent(threadId)}?api_key=${encodeURIComponent(API_KEY)}`
+        : `${WS_BASE_URL}/ws/${encodeURIComponent(threadId)}`;
+      const socket = new WebSocket(wsUrl);
       socketRef.current = socket;
 
       socket.onopen = () => {
