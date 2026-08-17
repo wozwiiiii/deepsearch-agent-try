@@ -11,6 +11,7 @@ API Key 认证与多租户隔离测试
 import io
 
 import pytest
+from fastapi import HTTPException
 from fastapi.testclient import TestClient
 from starlette.websockets import WebSocketDisconnect
 
@@ -45,6 +46,46 @@ class TestParseApiKeys:
             parse_api_keys(raw)
 
 
+class TestDevModeFailClosed:
+    """第三批改造：未配置 API_KEYS 时默认拒绝（fail-closed），需显式 ALLOW_DEV_MODE=1"""
+
+    def test_no_keys_no_dev_mode_returns_503(self, monkeypatch):
+        monkeypatch.delenv("API_KEYS", raising=False)
+        monkeypatch.delenv("ALLOW_DEV_MODE", raising=False)
+        with pytest.raises(HTTPException) as exc_info:
+            authenticate_api_key("whatever")
+        assert exc_info.value.status_code == 503
+
+    def test_no_keys_explicit_dev_mode_allowed(self, monkeypatch):
+        monkeypatch.delenv("API_KEYS", raising=False)
+        monkeypatch.setenv("ALLOW_DEV_MODE", "1")
+        assert authenticate_api_key("whatever").user_id == DEV_USER_ID
+
+    def test_dev_mode_not_1_rejected(self, monkeypatch):
+        # 值不等于 "1" 一律拒绝，防止误配 true/yes 等"看起来像开"的值
+        monkeypatch.delenv("API_KEYS", raising=False)
+        monkeypatch.setenv("ALLOW_DEV_MODE", "true")
+        with pytest.raises(HTTPException) as exc_info:
+            authenticate_api_key("whatever")
+        assert exc_info.value.status_code == 503
+
+    def test_endpoint_503_without_keys_and_dev_mode(self, client, monkeypatch):
+        monkeypatch.delenv("API_KEYS", raising=False)
+        monkeypatch.delenv("ALLOW_DEV_MODE", raising=False)
+        response = client.post(
+            "/api/task", json={"query": "任务", "thread_id": "t-fail-1"}
+        )
+        assert response.status_code == 503
+        assert "ALLOW_DEV_MODE" in response.json()["detail"]
+
+    def test_ws_rejected_without_keys_and_dev_mode(self, client, monkeypatch):
+        monkeypatch.delenv("API_KEYS", raising=False)
+        monkeypatch.delenv("ALLOW_DEV_MODE", raising=False)
+        with pytest.raises(WebSocketDisconnect):
+            with client.websocket_connect("/ws/t-fail-2"):
+                pass
+
+
 class TestAuthenticateApiKey:
     def test_dev_mode_when_not_configured(self, monkeypatch):
         monkeypatch.delenv("API_KEYS", raising=False)
@@ -64,6 +105,25 @@ class TestAuthenticateApiKey:
         with pytest.raises(HTTPException) as exc_info:
             authenticate_api_key(bad_key)
         assert exc_info.value.status_code == 401
+
+    def test_non_ascii_key_rejected_not_500(self, client, monkeypatch):
+        # 非 ASCII 密钥头应返回 401，而不是 compare_digest 抛 TypeError 变成 500
+        # （审查修复 L-1）。httpx 允许 bytes 形式的头值，UTF-8 字节经服务端
+        # latin-1 解码后即为非 ASCII 字符串
+        monkeypatch.setenv("API_KEYS", f"alice:{ALICE_KEY}")
+        response = client.post(
+            "/api/task",
+            json={"query": "任务", "thread_id": "t-ascii"},
+            headers={"X-API-Key": "sk-密钥-1234567890abcdef".encode("utf-8")},
+        )
+        assert response.status_code == 401
+
+
+@pytest.fixture(autouse=True)
+def isolate_runtime_dirs(tmp_path, monkeypatch):
+    """运行时目录指向临时目录：测试不读写真实 output/updated（审查修复 M-2）"""
+    monkeypatch.setattr(server, "output_dir", tmp_path / "output")
+    monkeypatch.setattr(server, "updated_dir", tmp_path / "updated")
 
 
 @pytest.fixture

@@ -9,6 +9,7 @@ execute_sql_query 用于在确认结构后执行自定义查询。
 import os
 import re
 
+import sqlglot
 from dotenv import load_dotenv
 from langchain_core.tools import tool
 from mysql.connector import Error, connect
@@ -49,6 +50,12 @@ _FORBIDDEN_SQL_KEYWORD_PATTERN = re.compile(
 
 # 合法表名只允许字母、数字和下划线，配合反引号包裹彻底杜绝表名注入
 _TABLE_NAME_PATTERN = re.compile(r"^[A-Za-z0-9_]{1,64}$")
+
+# 无 LIMIT 的 SELECT 自动追加的行数上限（第三批改造），可用 SQL_MAX_LIMIT 调整
+DEFAULT_SELECT_LIMIT = int(os.getenv("SQL_MAX_LIMIT", "1000"))
+
+# 仅 SELECT 走 sqlglot 改写；SHOW/DESCRIBE/EXPLAIN 语法特殊，原样透传
+_SELECT_START_PATTERN = re.compile(r"^\s*SELECT\b", re.IGNORECASE)
 
 
 class SQLSafetyError(ValueError):
@@ -99,6 +106,40 @@ def validate_table_name(table_name: str) -> str:
             f"非法表名: {table_name!r}，仅允许字母、数字和下划线"
         )
     return str(table_name)
+
+
+def enforce_select_limit(sql: str, default_limit: int = None) -> str:
+    """
+    给不带 LIMIT 的 SELECT 追加行数上限（第三批改造）
+
+    背景：只读校验放行的 `SELECT *` 在真实业务库（百万行表）上会拖垮数据库，
+    也会把海量行拼进模型上下文。用 sqlglot 按 MySQL 方言解析后检查 LIMIT 子句，
+    缺失则补默认值；已有 LIMIT 的语句保持原样。
+
+    :param sql: 已通过 assert_readonly_sql 校验的 SQL
+    :param default_limit: 追加的行数上限，默认取 SQL_MAX_LIMIT
+    :return: 改写后的 SQL
+    :raises SQLSafetyError: SELECT 无法解析时拒绝执行（fail-closed，
+        模型收到错误文本后可改写重试）
+    """
+    limit = default_limit if default_limit is not None else DEFAULT_SELECT_LIMIT
+
+    # SHOW/DESCRIBE/EXPLAIN 语法特殊且本身返回量小，原样透传
+    if not _SELECT_START_PATTERN.match(sql):
+        return sql
+
+    try:
+        expression = sqlglot.parse_one(sql, read="mysql")
+    except sqlglot.errors.ParseError as e:
+        raise SQLSafetyError(
+            f"SQL 解析失败，已拒绝执行（请检查语法后重试）: {e}"
+        )
+
+    # 只对顶层 SELECT 补 LIMIT；带 LIMIT/OFFSET 的语句 sqlglot 会记录在 args['limit']
+    if isinstance(expression, sqlglot.exp.Select) and expression.args.get("limit") is None:
+        expression = expression.limit(limit)
+
+    return expression.sql(dialect="mysql")
 
 
 # 集中读取数据库配置，后续三个工具都复用这份连接参数
@@ -276,7 +317,7 @@ def execute_sql_query(query) -> str:
 
     # 只读防护：剥离注释后校验语句形式，不通过则直接拒绝，不建立数据库连接
     try:
-        safe_query = assert_readonly_sql(query)
+        safe_query = enforce_select_limit(assert_readonly_sql(query))
     except SQLSafetyError as e:
         return str(e)
 

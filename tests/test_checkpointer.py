@@ -76,3 +76,34 @@ class TestLazyAgentInit:
         # 二次调用复用同一实例，不重复建立数据库连接
         agent_again = asyncio.run(main_agent_module._get_agent())
         assert agent_again is agent
+
+
+class TestModelCallLimitMiddleware:
+    """第三批成本治理：Agent 必须带模型调用硬上限，超限抛错由上层统一捕获"""
+
+    def test_agent_configured_with_call_limit_middleware(self, tmp_path, monkeypatch):
+        from langchain.agents.middleware import ModelCallLimitMiddleware
+
+        recorded = {}
+
+        def _fake_create_deep_agent(**kwargs):
+            recorded.update(kwargs)
+            return object()
+
+        monkeypatch.setattr(main_agent_module, "create_deep_agent", _fake_create_deep_agent)
+        monkeypatch.setattr(
+            main_agent_module, "CHECKPOINT_DB", str(tmp_path / "cp.sqlite3")
+        )
+        monkeypatch.setattr(main_agent_module, "_main_agent", None)
+        monkeypatch.setattr(main_agent_module, "_checkpoint_saver", None)
+        monkeypatch.setattr(main_agent_module, "MODEL_RUN_LIMIT", 5)
+        monkeypatch.setattr(main_agent_module, "MODEL_THREAD_LIMIT", 9)
+
+        asyncio.run(main_agent_module._get_agent())
+
+        middlewares = recorded.get("middleware", [])
+        assert len(middlewares) == 1
+        assert isinstance(middlewares[0], ModelCallLimitMiddleware)
+        # 上限值透传正确，超限行为为抛错（而不是静默截断）
+        assert middlewares[0].run_limit == 5
+        assert middlewares[0].thread_limit == 9

@@ -1,0 +1,59 @@
+# CI（生产化改造第三批）
+#
+# 后端：uv 安装依赖后跑全部 pytest 用例（conftest 注入占位密钥，
+#       不需要真实 LLM/Tavily/MySQL 服务）。
+# 前端：pnpm 安装依赖后跑 TypeScript 类型检查。
+#
+# 触发：push 到任意分支 + 针对 main/production-hardening 的 PR。
+
+name: CI
+
+on:
+  push:
+  pull_request:
+    branches: [main, production-hardening]
+
+jobs:
+  backend:
+    name: Backend tests (pytest)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install uv
+        run: pip install uv
+
+      - name: Sync dependencies
+        run: python -m uv sync --group dev
+
+      - name: Run tests
+        run: python -m uv run pytest tests/ -q
+
+  frontend:
+    name: Frontend typecheck (tsc)
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: frontend
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: pnpm/action-setup@v4
+        with:
+          version: 10
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: pnpm
+          cache-dependency-path: frontend/pnpm-lock.yaml
+
+      - name: Install dependencies
+        run: pnpm install --frozen-lockfile
+
+      - name: Typecheck
+        run: pnpm exec tsc -b

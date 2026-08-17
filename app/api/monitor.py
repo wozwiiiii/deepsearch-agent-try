@@ -131,6 +131,10 @@ class ToolMonitor:
         """报告任务已被用户取消"""
         self._emit("task_cancelled", "任务已取消")
 
+    def report_error(self, message: str) -> None:
+        """报告任务执行错误（公开接口，供 API/Agent 层上报异常事件）"""
+        self._emit("error", message)
+
     def report_session_dir(self, path: str) -> None:
         """报告当前任务工作目录"""
         self._emit("session_created", f"工作目录已创建: {path}", {"path": path})

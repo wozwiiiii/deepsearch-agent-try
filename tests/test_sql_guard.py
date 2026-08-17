@@ -2,7 +2,7 @@
 SQL 只读防护测试
 
 纯函数测试，不依赖 MySQL：覆盖语句形式校验、注释伪装、多语句注入、
-危险关键字和表名白名单。
+危险关键字、表名白名单，以及无 LIMIT SELECT 的自动追加上限。
 """
 
 import pytest
@@ -10,6 +10,7 @@ import pytest
 from app.tools.db_tools import (
     SQLSafetyError,
     assert_readonly_sql,
+    enforce_select_limit,
     validate_table_name,
 )
 
@@ -68,6 +69,45 @@ class TestAssertReadonlySql:
         # rstrip(';') 只去结尾分号，中间分号必须仍然触发多语句拒绝
         with pytest.raises(SQLSafetyError):
             assert_readonly_sql("SELECT 1; DROP TABLE drugs;")
+
+
+class TestEnforceSelectLimit:
+    """第三批改造：无 LIMIT 的 SELECT 自动追加行数上限（防大表全量扫描）"""
+
+    def test_select_without_limit_gets_default(self):
+        result = enforce_select_limit("SELECT * FROM drugs WHERE therapeutic_area = '心血管'")
+        assert "LIMIT" in result.upper()
+        assert "LIMIT 1000" in result
+
+    def test_select_with_existing_limit_preserved(self):
+        result = enforce_select_limit("SELECT id FROM drugs LIMIT 5")
+        assert result.upper().count("LIMIT") == 1
+        assert "LIMIT 5" in result
+
+    def test_join_query_limit_appended_semantics_kept(self):
+        result = enforce_select_limit(
+            "SELECT d.generic_name FROM drugs d JOIN inventory i ON d.drug_id = i.drug_id"
+        )
+        assert "JOIN" in result.upper()
+        assert "LIMIT 1000" in result
+
+    def test_show_statement_passthrough_unchanged(self):
+        assert enforce_select_limit("SHOW TABLES") == "SHOW TABLES"
+        assert enforce_select_limit("DESCRIBE drugs") == "DESCRIBE drugs"
+
+    def test_custom_default_limit(self):
+        result = enforce_select_limit("SELECT * FROM drugs", default_limit=7)
+        assert "LIMIT 7" in result
+
+    def test_unparseable_select_rejected(self):
+        with pytest.raises(SQLSafetyError):
+            enforce_select_limit("SELECT FROM WHERE")
+
+    def test_full_pipeline_readonly_then_limit(self):
+        # 与 execute_sql_query 相同的组合：校验 -> 改写
+        safe = assert_readonly_sql("select name from sales_records")
+        rewritten = enforce_select_limit(safe)
+        assert "LIMIT" in rewritten.upper()
 
 
 class TestValidateTableName:

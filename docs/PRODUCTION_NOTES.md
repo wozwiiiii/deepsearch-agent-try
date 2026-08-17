@@ -7,6 +7,8 @@
 >
 > - 第一批（安全加固）：路径穿越、SQL 只读、上传限制、横向越权、CORS 等 7 类问题
 > - 第二批（认证与状态）：API Key 认证 + 多租户隔离 + SQLite 持久化 checkpointer
+> - 第三批（限流与成本）：slowapi 按密钥限流 + fail-closed 开发模式 + 模型调用硬上限
+> - 审查修复：代码审查发现的 4 项问题（上传总量限制、失败回滚、测试隔离、非 ASCII 密钥）
 
 ## 一、已完成的修复
 
@@ -19,7 +21,7 @@
   - 绝对路径（Windows 盘符 / Unix 根路径）一律拒绝，要求模型改用相对路径；
   - 删除 `updated/` 旁路分支，历史路径形式折叠为会话目录内文件名；
   - 三个文件工具捕获 `PathEscapeError` 并返回引导性错误文本，模型可自我纠正重试，不中断 Agent 循环。
-- **验证**：`tests/test_path_safety.py`（16 个用例：穿越、盘符路径、`/etc/passwd`、updated 旁路、空文件名等全部拒绝；正常相对路径、虚拟前缀、冗余层级压平正常工作）。
+- **验证**：`tests/test_path_safety.py`（14 个用例：穿越、盘符路径、`/etc/passwd`、updated 旁路、空文件名等全部拒绝；正常相对路径、虚拟前缀、冗余层级压平正常工作）。
 
 ### 2. SQL 任意执行与表名注入（工具层）
 
@@ -29,7 +31,7 @@
   - 新增 `assert_readonly_sql`：剥离注释后仅放行 `SELECT / SHOW / DESCRIBE / EXPLAIN` 单条语句；多语句（stacked queries）、`INTO OUTFILE/DUMPFILE`、`LOAD_FILE`、DML/DDL 关键字一律拒绝；
   - 新增 `validate_table_name`：表名白名单 `^[A-Za-z0-9_]{1,64}$` + 反引号包裹；
   - 被拒绝的 SQL 不建立数据库连接，直接返回错误文本。
-- **验证**：`tests/test_sql_guard.py`（24 个用例：注释伪装、多语句注入、`load_file` 读敏感文件、反引号逃逸等全部拦截）。
+- **验证**：`tests/test_sql_guard.py`（41 个用例：注释伪装、多语句注入、`load_file` 读敏感文件、反引号逃逸、SELECT 无 LIMIT 自动追加等全部拦截）。
 - **部署配套**（账号层兜底，需在数据库侧执行）：
   ```sql
   CREATE USER 'deepsearch_ro'@'%' IDENTIFIED BY '<强密码>';
@@ -51,7 +53,7 @@
 | 3.6 | 无健康检查 | 容器/负载均衡无法探活 | 新增 `GET /health` |
 | 3.7 | 任务文本无长度限制 | 超长输入直接打满模型上下文（成本攻击面） | `query` 限制 1–10000 字符（Pydantic Field） |
 
-- **验证**：`tests/test_api_security.py`（36 个用例，`run_deep_agent` monkeypatch 为空协程，不发起真实 LLM 调用）。
+- **验证**：`tests/test_api_security.py`（28 个用例，`run_deep_agent` monkeypatch 为空协程，不发起真实 LLM 调用）。
 
 ### 4. 前端适配
 
@@ -89,10 +91,48 @@
 - **验证**：`tests/test_checkpointer.py`（checkpoint 写入后由**新 saver 实例**（等价重启）读回；thread 间隔离；惰性初始化建库且缓存复用）。
 - **边界说明**：SQLite 适合单机部署；多副本水平扩容时换 `langgraph-checkpoint-postgres`，接口不变，只换 saver 实现。
 
-## 三、如何验证
+## 三、第三批：限流、fail-closed 与模型调用硬上限
+
+### 8. 接口限流（`server.py`，slowapi）
+
+- **原问题**：认证挡住了陌生人，但一个合法密钥可以无限发任务（烧 LLM/Tavily 费用）、无限上传。
+- **修复**：
+  - `POST /api/task` 限 `RATE_LIMIT_TASK`（默认 10 次/分钟）、`POST /api/upload` 限 `RATE_LIMIT_UPLOAD`（默认 30 次/分钟）；
+  - 限流键按**密钥哈希**（SHA-256 截断 16 位，明文不入限流状态与日志）计，无密钥（开发模式）回退客户端 IP；
+  - 超限返回 429 + 剩余额度响应头；认证先于限流执行，401 请求不消耗配额。
+- **已知边界**：反向代理后所有无密钥用户共享 IP；生产应确保客户端都携带密钥或配置可信代理解析。
+- **验证**：`tests/test_rate_limit.py`（7 个用例：限流键构造、任务/上传超限 429、不同密钥独立配额、认证先于限流）。
+
+### 9. 开发模式 fail-closed（`auth.py`）
+
+- **原问题**：第二批的"未配置 API_KEYS 即开发模式"是 fail-open——部署时忘配密钥服务照常启动且完全开放。
+- **修复**：未配置 `API_KEYS` 时业务接口默认返回 503；仅显式设置 `ALLOW_DEV_MODE=1` 才进入本地开发模式（归属 local 用户）；启动时 lifespan 打印配置状态（含醒目警告）。
+- **验证**：`tests/test_auth.py::TestDevModeFailClosed`（未配置+未开启=503；显式开启=放行；`ALLOW_DEV_MODE=true` 等"看似开启"的值一律拒绝）。
+
+### 10. 模型调用硬上限（`main_agent.py`，ModelCallLimitMiddleware）
+
+- **原问题**：提示注入或规划失控可让模型无限循环烧 token；提示词里"最多检索 5 次"只是软约束。
+- **修复**：`ModelCallLimitMiddleware(run_limit=80, thread_limit=300, exit_behavior="error")`——单次任务最多 80 次模型调用、单会话（跨重启累计）最多 300 次，超限抛异常由 `run_deep_agent` 捕获并经 monitor 告知前端。阈值可用 `MODEL_RUN_LIMIT` / `MODEL_THREAD_LIMIT` 环境变量调整。
+- **边界**：这是调用次数上限，不是 token 预算；token 级熔断（按 usage_metadata 累计）仍是待做项。
+
+## 四、代码审查修复（2026-08-17）
+
+对前三批全部增量做正式代码审查后修复的 4 项：
+
+| # | 问题 | 修复 | 验证 |
+|---|------|------|------|
+| R-1 | 上传总量无上限：`MAX_UPLOAD_SIZE` 只限单文件，一次传 N 个文件可绕过（磁盘耗尽） | 新增请求级 `MAX_UPLOAD_TOTAL_SIZE`（默认 100MB）+ `MAX_UPLOAD_FILES`（默认 20），写盘前拒绝超量 | `test_too_many_files_rejected_before_write`、`test_total_size_limit_rolls_back_saved_files` |
+| R-2 | 多文件上传非原子：第 N 个文件失败时前 N-1 个已落盘，留下部分上传状态 | `_rollback_saved`：任一文件校验/写入失败即清理本次已写入的全部文件 | `test_total_size_limit_rolls_back_saved_files`、`test_invalid_extension_rolls_back_previous_files` |
+| R-3 | 非 ASCII 密钥头触发 `compare_digest` TypeError → 500（错误处理缺陷，可刷错误日志） | 非 ASCII 密钥直接按无效处理返回 401（不可能匹配任何合法密钥） | `test_non_ascii_key_rejected_not_500` |
+| R-4 | 测试直接读写真实 `app/output`、`app/updated` 运行时目录（残留文件可能被真实任务读到） | 三个 API 测试文件加 autouse fixture，把 `output_dir`/`updated_dir` 指向 `tmp_path`；已清理历史残留 | 修复后全量测试跑完真实目录 0 文件 |
+
+审查中记录但暂缓的低优先级项（见面试/03 缺陷清单）：`_agent_init_lock` 跨事件循环隐患（加注释/重构）、`rglob` 符号链接防御、`last_msg.content` 类型防御、前端 401 专门提示。
+
+## 五、如何验证
 
 ```bash
-# 后端全部测试（101 个用例：安全 + 认证/租户 + 持久化）
+# 后端全部测试（125 个用例：安全 86 + 认证/租户/限流 35 + 持久化 4）
+# 分布：path_safety 14 / sql_guard 41 / api_security 31 / auth 28 / rate_limit 7 / checkpointer 4
 uv sync --group dev
 uv run pytest tests/ -q
 
@@ -100,21 +140,21 @@ uv run pytest tests/ -q
 cd frontend && pnpm install && pnpm exec tsc -b
 ```
 
-## 四、尚未完成的企业级差距（下一步路线图）
+## 六、尚未完成的企业级差距（下一步路线图）
 
 以下按「上线阻塞性」排序，是诚实的能力边界，也是后续迭代计划：
 
-1. **限流与成本控制（上线前必须）**：`slowapi` 按 IP/用户限流；DeepAgents 已有模型调用次数限制中间件（见 `examples/13-model-call-limit-middleware.py`），接入主 Agent；LLM 调用计入预算熔断。
-2. **任务队列与并发治理**：当前 `asyncio.create_task` 进程内执行，重启即丢、无法水平扩容；`active_tasks` 是进程内 dict，多 worker 部署下取消接口失效。引入 Celery / ARQ / Temporal，Agent 执行与 API 进程分离，任务状态入 Redis 或数据库。
-3. **可观测性**：`print` 全量替换为结构化日志（logging + JSON formatter），接入 OpenTelemetry trace（LangSmith / LangFuse 追踪 Agent 链路），Prometheus 指标（任务时长、工具失败率、LLM token 消耗）+ 告警。
-4. **评测体系**：固定评测集（20–50 个典型任务）+ LLM-as-judge 自动评分 + 检索质量（命中率/引用准确率）指标，接 CI 做回归。这是 Agent 项目区别于 demo 的核心证据。
-5. **CI/CD**：GitHub Actions（lint + pytest + tsc + build），pre-commit 已有配置需补齐 ruff/mypy 钩子；后端目前无 Dockerfile（只有 MySQL compose），需补多阶段构建镜像。
-6. **内容安全**：上传文件病毒扫描（ClamAV）、模型输出审核（涉政/敏感词）、提示注入防护（系统提示与用户输入隔离、工具结果标记为不可信数据）。
-7. **认证升级路径**：当前 API Key 适合个人/小团队部署；对外多用户产品需换 OIDC（Authing / Casdoor / Auth0）+ JWT，密钥轮换与吊销机制。
+1. **任务队列与并发治理（上线前必须）**：当前 `asyncio.create_task` 进程内执行，重启即丢、无法水平扩容；`active_tasks` 是进程内 dict，多 worker 部署下取消接口失效。引入 Celery / ARQ / Temporal，Agent 执行与 API 进程分离，任务状态入 Redis 或数据库。~~限流与成本控制~~（第三批已完成 slowapi 限流 + 模型调用上限；token 级预算熔断仍待做）。
+2. **可观测性**：`print` 全量替换为结构化日志（logging + JSON formatter），接入 OpenTelemetry trace（LangSmith / LangFuse 追踪 Agent 链路），Prometheus 指标（任务时长、工具失败率、LLM token 消耗）+ 告警。
+3. **评测体系**：固定评测集（20–50 个典型任务）+ LLM-as-judge 自动评分 + 检索质量（命中率/引用准确率）指标，接 CI 做回归。这是 Agent 项目区别于 demo 的核心证据。
+4. **CI/CD**：GitHub Actions（lint + pytest + tsc + build），pre-commit 已有配置需补齐 ruff/mypy 钩子；后端目前无 Dockerfile（只有 MySQL compose），需补多阶段构建镜像。
+5. **内容安全**：上传文件病毒扫描（ClamAV）、模型输出审核（涉政/敏感词）、提示注入防护（系统提示与用户输入隔离、工具结果标记为不可信数据）。
+6. **认证升级路径**：当前 API Key 适合个人/小团队部署；对外多用户产品需换 OIDC（Authing / Casdoor / Auth0）+ JWT，密钥轮换与吊销机制（短时一次性令牌替代查询参数密钥）。
 
-## 五、与上游教学版的关系
+## 七、与上游教学版的关系
 
 本仓库基于开源教学项目 deepsearch-agents（MIT 协议）。简历与面试中的正确定位是：
-"基于开源教学项目做了**生产化安全改造**：修复路径穿越、SQL 任意执行、横向越权、
-无限制上传等 7 类问题，补齐 76 个安全回归测试"——而不是把整个项目说成从零自研。
+"基于开源教学项目做了**生产化改造**：三批改造 + 一次正式代码审查修复，覆盖路径穿越、
+SQL 任意执行、横向越权、无认证、租户串台、无限流等 14 类问题，125 个回归测试"——
+而不是把整个项目说成从零自研。
 能逐条讲清楚"原版哪里有洞、我怎么修的、怎么验证的"，比笼统的"独立开发"更可信。

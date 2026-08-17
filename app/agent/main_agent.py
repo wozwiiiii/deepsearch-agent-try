@@ -21,6 +21,7 @@ import shutil
 from pathlib import Path
 
 from deepagents import create_deep_agent
+from langchain.agents.middleware import ModelCallLimitMiddleware
 from langgraph.checkpoint.sqlite.aio import AsyncSqliteSaver
 
 from app.agent.llm import model
@@ -47,6 +48,15 @@ project_root_path = Path(__file__).parents[1].resolve()
 CHECKPOINT_DB = os.getenv(
     "CHECKPOINT_DB", str(project_root_path / "data" / "checkpoints.sqlite3")
 )
+
+# 模型调用次数硬上限（第三批成本治理）：
+# - run_limit 限制单次任务内的模型调用总数（主智能体 + 子智能体各自循环都计数），
+#   防止提示注入或规划失控导致无限烧 token；
+# - thread_limit 限制同一复合 thread_id 的累计调用数（checkpointer 持久化后
+#   会话可以跨重启续聊，长会话也需要总量上限）。
+# 默认值按"复杂研究任务约 3 个子智能体 × 10-20 轮规划"量级设定，可用环境变量调整
+MODEL_RUN_LIMIT = int(os.getenv("MODEL_RUN_LIMIT", "80"))
+MODEL_THREAD_LIMIT = int(os.getenv("MODEL_THREAD_LIMIT", "300"))
 
 # 主智能体是调度中心：
 # 1. tools 只放最终交付相关的文件工具
@@ -90,8 +100,19 @@ async def _get_agent():
                 network_search_agent,
                 knowledge_base_agent,
             ],
+            # 成本硬上限：超限抛异常，由 run_deep_agent 统一捕获并经 monitor 告知前端
+            middleware=[
+                ModelCallLimitMiddleware(
+                    run_limit=MODEL_RUN_LIMIT,
+                    thread_limit=MODEL_THREAD_LIMIT,
+                    exit_behavior="error",
+                )
+            ],
         )
-        print(f"[MainAgent] 已初始化，checkpointer=sqlite:{db_path}")
+        print(
+            f"[MainAgent] 已初始化，checkpointer=sqlite:{db_path}，"
+            f"模型调用上限 run={MODEL_RUN_LIMIT}/thread={MODEL_THREAD_LIMIT}"
+        )
         return _main_agent
 
 
@@ -210,7 +231,7 @@ async def run_deep_agent(task_query, session_id, user_id="local"):
         raise
     except Exception as e:
         # 异步执行异常也走 monitor，保证前端能收到明确错误事件
-        monitor._emit("error", f"执行主智能发生异常信息：{str(e)}")
+        monitor.report_error(f"执行主智能发生异常信息：{str(e)}")
     finally:
         # 任务结束后恢复 ContextVar，避免后续请求复用到本次会话目录或 thread_id
         reset_session_context(session_dir_token, session_id_token)

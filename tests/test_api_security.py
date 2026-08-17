@@ -18,6 +18,13 @@ from fastapi.testclient import TestClient
 from app.api import server
 
 
+@pytest.fixture(autouse=True)
+def isolate_runtime_dirs(tmp_path, monkeypatch):
+    """运行时目录指向临时目录：测试不读写真实 output/updated（审查修复 M-2）"""
+    monkeypatch.setattr(server, "output_dir", tmp_path / "output")
+    monkeypatch.setattr(server, "updated_dir", tmp_path / "updated")
+
+
 @pytest.fixture
 def client(monkeypatch):
     async def _noop_agent(*args, **kwargs):
@@ -114,6 +121,40 @@ class TestUploadSafety:
         assert not (
             server.updated_dir / "user_local" / "session_tid_test" / "big.txt"
         ).exists()
+
+    def _upload_many(self, client, thread_id, file_list):
+        return client.post(
+            "/api/upload",
+            data={"thread_id": thread_id},
+            files=[("files", (name, io.BytesIO(content))) for name, content in file_list],
+        )
+
+    def test_too_many_files_rejected_before_write(self, client, monkeypatch):
+        # 文件数上限在写盘前拒绝（审查修复 M-1）
+        monkeypatch.setattr(server, "MAX_UPLOAD_FILES", 2)
+        response = self._upload_many(
+            client, "tid_many", [("a.md", b"x"), ("b.md", b"x"), ("c.md", b"x")]
+        )
+        assert response.status_code == 413
+
+    def test_total_size_limit_rolls_back_saved_files(self, client, monkeypatch):
+        # 单文件都合法、但总量超限：已写入的文件必须回滚（审查修复 M-1/L-2）
+        monkeypatch.setattr(server, "MAX_UPLOAD_TOTAL_SIZE", 8)
+        response = self._upload_many(
+            client, "tid_total", [("first.md", b"12345"), ("second.md", b"12345")]
+        )
+        assert response.status_code == 413
+        session_dir = server.updated_dir / "user_local" / "session_tid_total"
+        assert not (session_dir / "first.md").exists()
+        assert not (session_dir / "second.md").exists()
+
+    def test_invalid_extension_rolls_back_previous_files(self, client):
+        # 第 2 个文件类型非法时，第 1 个已落盘文件必须回滚（审查修复 L-2）
+        response = self._upload_many(
+            client, "tid_rb", [("ok.md", b"x"), ("bad.exe", b"x")]
+        )
+        assert response.status_code == 400
+        assert not (server.updated_dir / "user_local" / "session_tid_rb" / "ok.md").exists()
 
 
 class TestFileIsolation:

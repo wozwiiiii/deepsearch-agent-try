@@ -16,6 +16,7 @@ WebSocket 长连接。HTTP 接口只做轻量调度，真正的 DeepAgents 执�
 """
 
 import asyncio
+import hashlib
 import os
 import re
 import uuid
@@ -32,6 +33,7 @@ from fastapi import (
     Form,
     Header,
     HTTPException,
+    Request,
     UploadFile,
     WebSocket,
     WebSocketDisconnect,
@@ -39,9 +41,18 @@ from fastapi import (
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse
 from pydantic import BaseModel, Field
+from slowapi import Limiter
+from slowapi.errors import RateLimitExceeded
+from slowapi.util import get_remote_address
+from starlette.responses import JSONResponse
 
 from app.agent.main_agent import run_deep_agent
-from app.api.auth import Principal, authenticate_api_key, require_principal
+from app.api.auth import (
+    Principal,
+    authenticate_api_key,
+    is_dev_mode_enabled,
+    require_principal,
+)
 from app.api.monitor import manager
 
 # ---------------------------------------------------------------------------
@@ -59,6 +70,14 @@ ALLOWED_UPLOAD_EXTENSIONS = {".md", ".txt", ".pdf", ".docx", ".xlsx", ".xls", ".
 MAX_UPLOAD_SIZE_MB = int(os.getenv("MAX_UPLOAD_SIZE_MB", "20"))
 MAX_UPLOAD_SIZE = MAX_UPLOAD_SIZE_MB * 1024 * 1024
 
+# 单请求上传总大小上限（字节），默认 100MB：单文件限制可被"一次传很多文件"
+# 绕过，必须同时限制请求级总量，防止磁盘耗尽（代码审查修复 M-1）
+MAX_UPLOAD_TOTAL_MB = int(os.getenv("MAX_UPLOAD_TOTAL_MB", "100"))
+MAX_UPLOAD_TOTAL_SIZE = MAX_UPLOAD_TOTAL_MB * 1024 * 1024
+
+# 单请求文件数上限：海量小文件同样能绕过字节级限制
+MAX_UPLOAD_FILES = 20
+
 # 任务文本最大长度，防止异常超长输入直接打满模型上下文
 MAX_QUERY_LENGTH = 10_000
 
@@ -70,6 +89,32 @@ CORS_ORIGINS = [
     ).split(",")
     if origin.strip()
 ]
+
+# ---------------------------------------------------------------------------
+# 限流（第三批改造）：按"密钥身份"限流，防止合法密钥无限烧 LLM/Tavily 费用
+# ---------------------------------------------------------------------------
+
+# 任务与上传的限流阈值（limits 库语法：次数/时间窗），可用环境变量覆盖
+RATE_LIMIT_TASK = os.getenv("RATE_LIMIT_TASK", "10/minute")
+RATE_LIMIT_UPLOAD = os.getenv("RATE_LIMIT_UPLOAD", "30/minute")
+
+
+def _rate_limit_key(request: Request) -> str:
+    """
+    限流键：携带 API Key 的请求按密钥哈希计，开发模式回退按客户端 IP 计
+
+    密钥做 SHA-256 截断后再入键，避免明文密钥留在限流器的内存状态和日志里。
+    注意：反向代理后面所有用户共享 IP，生产部署应配置可信的 X-Forwarded-For
+    解析（PROXY_COUNT）或确保所有客户端都携带密钥。
+    """
+    api_key = request.headers.get("X-API-Key") or request.query_params.get("api_key")
+    if api_key:
+        digest = hashlib.sha256(api_key.encode("utf-8")).hexdigest()[:16]
+        return f"key:{digest}"
+    return f"ip:{get_remote_address(request)}"
+
+
+limiter = Limiter(key_func=_rate_limit_key)
 
 
 def validate_thread_id(thread_id: str) -> str:
@@ -135,17 +180,45 @@ def sanitize_filename(filename: str) -> str:
     return safe_name
 
 
+def _rollback_saved(paths: List[Path]) -> None:
+    """
+    多文件上传中途失败时，清理本次请求已写入的全部文件。
+
+    不回滚会留下"部分上传"状态：前 N-1 个文件已落盘但请求整体失败，
+    后续任务可能把这批不完整附件当作有效输入（代码审查修复 L-2）。
+    """
+    for path in paths:
+        path.unlink(missing_ok=True)
+
+
 @asynccontextmanager
 async def lifespan(_app: FastAPI):
     """
     服务生命周期入口。
 
     启动时绑定当前事件循环到 WebSocket 管理器，确保后台 Agent 任务可以把
-    monitor 事件投递回 FastAPI 所在的 loop。
+    monitor 事件投递回 FastAPI 所在的 loop；同时检查认证配置并给出醒目提示。
     """
     loop = asyncio.get_running_loop()
     manager.set_loop(loop)
     print(f"[Server] WebSocket Manager bound to loop: {id(loop)}")
+
+    # 启动时显式暴露认证配置状态，避免"忘配密钥裸奔"或"拒绝服务"排查困难
+    if os.getenv("API_KEYS", "").strip():
+        print(f"[Server] 认证已启用：API_KEYS 已配置")
+    elif is_dev_mode_enabled():
+        print(
+            "=" * 68 + "\n"
+            "[Server][警告] 开发模式运行中：未配置 API_KEYS，所有请求归属 local 用户。\n"
+            "[Server][警告] 该模式仅限本地联调，禁止暴露到公网。\n"
+            "[Server][警告] 部署前请在 .env 配置 API_KEYS=用户名:密钥 并移除 ALLOW_DEV_MODE。\n"
+            + "=" * 68
+        )
+    else:
+        print(
+            "[Server][错误] 未配置 API_KEYS 且未设置 ALLOW_DEV_MODE=1，"
+            "所有业务接口将返回 503。请配置 API_KEYS 后重启。"
+        )
     yield
 
 
@@ -176,6 +249,19 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
+# slowapi 限流器注册：装饰器方案要求把 limiter 挂到 app.state 并注册超限处理器
+app.state.limiter = limiter
+
+
+@app.exception_handler(RateLimitExceeded)
+async def rate_limit_exceeded_handler(request: Request, exc: RateLimitExceeded):
+    """超过限流阈值时返回 429，并在响应头中携带剩余额度信息（slowapi 提供）"""
+    return JSONResponse(
+        status_code=429,
+        content={"detail": "请求过于频繁，请稍后再试"},
+        headers=getattr(exc, "headers", None) or {},
+    )
+
 
 class TaskRequest(BaseModel):
     """前端启动任务时提交的请求体。"""
@@ -202,14 +288,17 @@ async def health():
 
 
 @app.post("/api/task")
-async def run_task(request: TaskRequest, principal: Principal = Depends(require_principal)):
+@limiter.limit(lambda: RATE_LIMIT_TASK)
+async def run_task(
+    request: Request, body: TaskRequest, principal: Principal = Depends(require_principal)
+):
     """
-    启动一次 DeepAgents 后台任务。
+    启动一次 DeepAgents 后台任务（每密钥限 RATE_LIMIT_TASK 次/分钟）。
 
     HTTP 请求只负责创建后台协程并立即返回，后续执行轨迹、子智能体调用和最终
     答案都会由 monitor 通过 `/ws/{thread_id}` 推送给同一会话的前端。
     """
-    thread_id = validate_thread_id(request.thread_id or str(uuid.uuid4()))
+    thread_id = validate_thread_id(body.thread_id or str(uuid.uuid4()))
     task_key = composite_task_key(principal.user_id, thread_id)
 
     # 同一用户同一 thread_id 只保留一个活跃任务；复合键保证跨租户互不影响
@@ -219,7 +308,7 @@ async def run_task(request: TaskRequest, principal: Principal = Depends(require_
 
     # create_task 把长耗时 Agent 执行交给事件循环，接口本身不用等待最终结果
     task = asyncio.create_task(
-        run_deep_agent(request.query, thread_id, principal.user_id)
+        run_deep_agent(body.query, thread_id, principal.user_id)
     )
     active_tasks[task_key] = task
     task.add_done_callback(lambda finished_task: _forget_task(task_key, finished_task))
@@ -260,13 +349,15 @@ async def cancel_task(thread_id: str, principal: Principal = Depends(require_pri
 
 
 @app.post("/api/upload")
+@limiter.limit(lambda: RATE_LIMIT_UPLOAD)
 async def upload_files(
+    request: Request,
     files: List[UploadFile] = File(...),
     thread_id: str = Form(...),
     principal: Principal = Depends(require_principal),
 ):
     """
-    文件上传接口 (File Upload)。
+    文件上传接口 (File Upload)（每密钥限 RATE_LIMIT_UPLOAD 次/分钟）。
 
     目标：
     1. 接收用户上传的一个或多个文件，校验扩展名白名单和大小上限。
@@ -279,16 +370,27 @@ async def upload_files(
     """
     validate_thread_id(thread_id)
 
+    # 文件数上限在写盘之前拒绝：海量小文件可绕过字节级限制（审查修复 M-1）
+    if len(files) > MAX_UPLOAD_FILES:
+        raise HTTPException(
+            status_code=413,
+            detail=f"单次最多上传 {MAX_UPLOAD_FILES} 个文件，当前 {len(files)} 个",
+        )
+
     # 上传文件按「租户 + 会话」两级隔离保存，避免不同用户读取到彼此的附件
     target_dir = user_scope_dir(updated_dir, principal.user_id, thread_id)
     target_dir.mkdir(parents=True, exist_ok=True)
 
     saved_files = []
+    saved_paths: List[Path] = []
+    total_written = 0
     for file in files:
         safe_name = sanitize_filename(file.filename or "")
 
         ext = Path(safe_name).suffix.lower()
         if ext not in ALLOWED_UPLOAD_EXTENSIONS:
+            # 任何一个文件校验失败，本次请求整体失败：回滚已写入的文件
+            _rollback_saved(saved_paths)
             raise HTTPException(
                 status_code=400,
                 detail=f"不支持的文件类型 '{ext}'，仅允许: {', '.join(sorted(ALLOWED_UPLOAD_EXTENSIONS))}",
@@ -306,15 +408,24 @@ async def upload_files(
                             status_code=413,
                             detail=f"文件 '{safe_name}' 超过大小上限 {MAX_UPLOAD_SIZE_MB}MB",
                         )
+                    if total_written + written > MAX_UPLOAD_TOTAL_SIZE:
+                        raise HTTPException(
+                            status_code=413,
+                            detail=f"本次上传总大小超过上限 {MAX_UPLOAD_TOTAL_MB}MB",
+                        )
                     await buffer.write(chunk)
         except HTTPException:
-            # 超限或写入失败时删除不完整的文件，避免残留半成品被 Agent 读取
+            # 超限或写入失败时删除不完整的文件，并回滚本次已保存的文件
             file_path.unlink(missing_ok=True)
+            _rollback_saved(saved_paths)
             raise
         except Exception as e:
             file_path.unlink(missing_ok=True)
+            _rollback_saved(saved_paths)
             raise HTTPException(status_code=500, detail=f"保存文件失败: {e}")
 
+        total_written += written
+        saved_paths.append(file_path)
         saved_files.append(safe_name)
 
     return {"status": "uploaded", "files": saved_files}
