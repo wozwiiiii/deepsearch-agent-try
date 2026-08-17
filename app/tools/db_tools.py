@@ -135,8 +135,14 @@ def enforce_select_limit(sql: str, default_limit: int = None) -> str:
             f"SQL 解析失败，已拒绝执行（请检查语法后重试）: {e}"
         )
 
-    # 只对顶层 SELECT 补 LIMIT；带 LIMIT/OFFSET 的语句 sqlglot 会记录在 args['limit']
-    if isinstance(expression, sqlglot.exp.Select) and expression.args.get("limit") is None:
+    # 顶层 SELECT 与集合操作（UNION/INTERSECT/EXCEPT，sqlglot 统一为 SetOperation）
+    # 都补 LIMIT；带 LIMIT 的语句 sqlglot 会记录在 args['limit']，原样保留。
+    # 子查询内的无 LIMIT 不在此处理：外层 LIMIT 已限制最终返回模型的行数。
+    # （审查修复：原实现只判 Select，UNION 等集合操作会漏过 LIMIT 注入）
+    if (
+        isinstance(expression, (sqlglot.exp.Select, sqlglot.exp.SetOperation))
+        and expression.args.get("limit") is None
+    ):
         expression = expression.limit(limit)
 
     return expression.sql(dialect="mysql")

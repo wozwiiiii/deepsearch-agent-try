@@ -109,6 +109,38 @@ class TestEnforceSelectLimit:
         rewritten = enforce_select_limit(safe)
         assert "LIMIT" in rewritten.upper()
 
+    def test_union_gets_default_limit(self):
+        # UNION 在 sqlglot 里是 SetOperation 节点而非 Select，原实现会漏过 LIMIT
+        result = enforce_select_limit(
+            "SELECT a FROM drugs UNION SELECT a FROM inventory"
+        )
+        assert "LIMIT 1000" in result
+
+    def test_union_all_intersect_except_get_limit(self):
+        for sql in (
+            "SELECT a FROM drugs UNION ALL SELECT a FROM inventory",
+            "SELECT a FROM drugs INTERSECT SELECT a FROM inventory",
+            "SELECT a FROM drugs EXCEPT SELECT a FROM inventory",
+        ):
+            result = enforce_select_limit(sql)
+            assert "LIMIT 1000" in result, f"集合操作未补 LIMIT: {sql} -> {result}"
+
+    def test_union_with_existing_top_limit_preserved(self):
+        # 顶层已有 LIMIT 时不覆盖
+        result = enforce_select_limit(
+            "SELECT a FROM drugs UNION SELECT a FROM inventory LIMIT 5"
+        )
+        assert "LIMIT 5" in result
+        assert "LIMIT 1000" not in result
+
+    def test_union_full_pipeline_readonly_then_limit(self):
+        # 与 execute_sql_query 相同组合：校验 -> 改写
+        safe = assert_readonly_sql(
+            "select name from drugs union select name from inventory"
+        )
+        rewritten = enforce_select_limit(safe)
+        assert "LIMIT" in rewritten.upper()
+
 
 class TestValidateTableName:
     @pytest.mark.parametrize(

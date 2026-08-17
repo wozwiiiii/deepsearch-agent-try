@@ -31,7 +31,7 @@
   - 新增 `assert_readonly_sql`：剥离注释后仅放行 `SELECT / SHOW / DESCRIBE / EXPLAIN` 单条语句；多语句（stacked queries）、`INTO OUTFILE/DUMPFILE`、`LOAD_FILE`、DML/DDL 关键字一律拒绝；
   - 新增 `validate_table_name`：表名白名单 `^[A-Za-z0-9_]{1,64}$` + 反引号包裹；
   - 被拒绝的 SQL 不建立数据库连接，直接返回错误文本。
-- **验证**：`tests/test_sql_guard.py`（41 个用例：注释伪装、多语句注入、`load_file` 读敏感文件、反引号逃逸、SELECT 无 LIMIT 自动追加等全部拦截）。
+- **验证**：`tests/test_sql_guard.py`（45 个用例：注释伪装、多语句注入、`load_file` 读敏感文件、反引号逃逸、SELECT 无 LIMIT 自动追加、UNION 等集合操作补 LIMIT 等全部拦截）。
 - **部署配套**（账号层兜底，需在数据库侧执行）：
   ```sql
   CREATE USER 'deepsearch_ro'@'%' IDENTIFIED BY '<强密码>';
@@ -131,8 +131,8 @@
 ## 五、如何验证
 
 ```bash
-# 后端全部测试（125 个用例：安全 86 + 认证/租户/限流 35 + 持久化 4）
-# 分布：path_safety 14 / sql_guard 41 / api_security 31 / auth 28 / rate_limit 7 / checkpointer 4
+# 后端全部测试（129 个用例：安全 90 + 认证/租户/限流 35 + 持久化 4）
+# 分布：path_safety 14 / sql_guard 45 / api_security 31 / auth 28 / rate_limit 7 / checkpointer 4
 uv sync --group dev
 uv run pytest tests/ -q
 
@@ -155,6 +155,6 @@ cd frontend && pnpm install && pnpm exec tsc -b
 
 本仓库基于开源教学项目 deepsearch-agents（MIT 协议）。简历与面试中的正确定位是：
 "基于开源教学项目做了**生产化改造**：三批改造 + 一次正式代码审查修复，覆盖路径穿越、
-SQL 任意执行、横向越权、无认证、租户串台、无限流等 14 类问题，125 个回归测试"——
+SQL 任意执行、横向越权、无认证、租户串台、无限流等 14 类问题，129 个回归测试"——
 而不是把整个项目说成从零自研。
 能逐条讲清楚"原版哪里有洞、我怎么修的、怎么验证的"，比笼统的"独立开发"更可信。

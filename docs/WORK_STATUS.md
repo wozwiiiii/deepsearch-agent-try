@@ -24,7 +24,7 @@
 
 - **修改文件**：15 个（+540 行 / -38 行）
 - **新增文件**：4 个（`tests/test_rate_limit.py`、`.github/workflows/ci.yml`、`docker/mysql/02-create-readonly-user.sh`、`docs/WORK_STATUS.md`）
-- **全量测试**：**125 个用例全部通过**（6.94s）
+- **全量测试**：**129 个用例全部通过**（6.94s）
 
 ### 2.2 按功能模块分组
 
@@ -98,27 +98,27 @@
 | 测试文件 | 用例数 | 覆盖领域 |
 |----------|--------|----------|
 | `tests/test_path_safety.py` | 14 | 路径穿越防御 |
-| `tests/test_sql_guard.py` | 41 | SQL 只读 + 自动 LIMIT |
+| `tests/test_sql_guard.py` | 45 | SQL 只读 + 自动 LIMIT + UNION |
 | `tests/test_api_security.py` | 31 | 上传安全 + 会话隔离 + 回滚 |
 | `tests/test_auth.py` | 28 | API Key 认证 + fail-closed + 非 ASCII |
 | `tests/test_rate_limit.py` | 7 | slowapi 限流 |
 | `tests/test_checkpointer.py` | 4 | SQLite 持久化 + middleware 透传 |
-| **合计** | **125** | — |
+| **合计** | **129** | — |
 
-> 注：实测分布（`pytest --co` 统计）：path 14 / sql 41 / api 31 / auth 28 / rate_limit 7 / checkpointer 4，合计 125。早期版本误记 sql_guard 为 34（连带总数误记 118），以实测为准。
+> 注：实测分布（`pytest --co` 统计）：path 14 / sql 45 / api 31 / auth 28 / rate_limit 7 / checkpointer 4，合计 129。早期版本误记 sql_guard 为 34（连带总数误记 118）；第三批后 sql_guard 增至 45（含 UNION 等集合操作补 LIMIT 用例），以实测为准。
 
 ---
 
 ## 四、面试文档状态
 
-4 份文档保存于 `D:\AI_Program\hello-agents-my-build\面试\`，版本不一致（实测核对）：
+4 份文档保存于 `D:\AI_Program\hello-agents-my-build\面试\`，已全部同步至第三批后状态（129 测试）：
 
-| 文档 | 版本 | 实测状态 |
+| 文档 | 版本 | 状态 |
 |------|------|----------|
-| `01-项目结构与核心逻辑解析.md` | 第二版 | 仍写 118 测试；第三批仅在脚注提"见 PRODUCTION_NOTES"，正文未展开 slowapi/ModelCallLimitMiddleware/CI |
-| `02-安全防护机制详解.md` | 第二版 | 同上；攻击面表已含认证态，但 fail-closed dev mode、限流键哈希、非 ASCII 密钥防御未进正文 |
-| `03-现存缺陷与改进路线.md` | 第三版 | 已含第三批内容（限流/成本/fail-closed 已标完成）；测试数误记 118（实为 125） |
-| `04-面试官问题清单与参考回答.md` | 第三版 | 已含限流/fail-closed/调用上限问答；测试数误记 118（实为 125） |
+| `01-项目结构与核心逻辑解析.md` | 第二版（数字已同步） | 测试数 129、提交清单含三批；正文聚焦前两批结构/安全，第三批见 PRODUCTION_NOTES |
+| `02-安全防护机制详解.md` | 第二版（数字已同步） | 测试数 129、分项含 UNION 补 LIMIT；正文聚焦前两批漏洞 |
+| `03-现存缺陷与改进路线.md` | 第三版 | 含第三批内容；P1-6 SQL 自动 LIMIT（含 UNION 残留）已标完成；测试数 129 |
+| `04-面试官问题清单与参考回答.md` | 第三版 | 含限流/fail-closed/调用上限问答；测试数 129 |
 
 ---
 
@@ -126,9 +126,10 @@
 
 | 优先级 | 任务 | 状态 |
 |--------|------|------|
-| ✅ **P0** | Git 提交第三批改动（15 modified + 4 new） | 已完成（本 commit） |
-| ✅ **P0** | 更新 `docs/PRODUCTION_NOTES.md` 测试计数（118→125、sql_guard 34→41）及审查修复节 | 已完成（本 commit 含） |
-| **P1** | 更新 `面试/` 4 份文档（01/02 补第三批说明 + 03/04 测试数 118→125） | 进行中 |
+| ✅ **P0** | Git 提交第三批改动（15 modified + 4 new） | 已完成（62f13ab） |
+| ✅ **P0** | 更新 `docs/PRODUCTION_NOTES.md` 测试计数（118→125→129、sql_guard 34→41→45）及审查修复节 | 已完成 |
+| ✅ **P1** | 更新 `面试/` 4 份文档（数字同步至 129、03 的 P1-6 标完成） | 已完成 |
+| ✅ **P1** | 修复审查发现：UNION 等集合操作漏过 SQL 自动 LIMIT（enforce_select_limit 扩展 SetOperation + 4 用例） | 已完成（本 commit） |
 | **P2** | 上线路线图中的企业级差距（任务队列、可观测性、评测体系） | 长期 |
 
 ---
