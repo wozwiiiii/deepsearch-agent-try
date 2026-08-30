@@ -66,13 +66,50 @@ export async function listSessionFiles(threadId: string): Promise<FileListRespon
   return requestJson<FileListResponse>(url);
 }
 
-export function getDownloadUrl(threadId: string, path: string): string {
+export interface LinkTokenResponse {
+  token: string;
+  expires_in: number;
+}
+
+export async function fetchLinkToken(): Promise<LinkTokenResponse> {
+  // 请求头认证（requestJson 自动注入 X-API-Key），换 60 秒短时令牌供 WS 握手用
+  return requestJson<LinkTokenResponse>(apiUrl("/api/token"), {
+    method: "POST"
+  });
+}
+
+export async function downloadSessionFile(threadId: string, path: string): Promise<void> {
   const url = new URL(apiUrl("/api/download"));
   url.searchParams.set("thread_id", threadId);
   url.searchParams.set("path", path);
-  // 下载走浏览器直链无法自定义请求头，密钥经查询参数传递
+
+  // fetch 可携带请求头：密钥不出现在 URL，也不进访问日志/浏览器历史；
+  // 拿到 blob 后再用临时 <a> 触发浏览器另存为
+  const headers = new Headers();
   if (API_KEY) {
-    url.searchParams.set("api_key", API_KEY);
+    headers.set("X-API-Key", API_KEY);
   }
-  return url.toString();
+  const response = await fetch(url, { headers });
+  if (!response.ok) {
+    let message = `HTTP ${response.status}`;
+    try {
+      const payload = (await response.json()) as { detail?: string };
+      if (payload?.detail) {
+        message = String(payload.detail);
+      }
+    } catch {
+      // 非 JSON 响应体（如网关错误页），保留默认消息
+    }
+    throw new Error(message);
+  }
+
+  const blob = await response.blob();
+  const objectUrl = URL.createObjectURL(blob);
+  const link = document.createElement("a");
+  link.href = objectUrl;
+  link.download = path.split("/").pop() || "download";
+  document.body.appendChild(link);
+  link.click();
+  link.remove();
+  URL.revokeObjectURL(objectUrl);
 }

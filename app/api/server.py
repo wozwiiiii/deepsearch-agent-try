@@ -51,7 +51,9 @@ from app.api.auth import (
     Principal,
     authenticate_api_key,
     is_dev_mode_enabled,
+    issue_link_token,
     require_principal,
+    resolve_link_token,
 )
 from app.api.event_store import event_store
 from app.api.monitor import manager
@@ -98,6 +100,9 @@ CORS_ORIGINS = [
 # 任务与上传的限流阈值（limits 库语法：次数/时间窗），可用环境变量覆盖
 RATE_LIMIT_TASK = os.getenv("RATE_LIMIT_TASK", "10/minute")
 RATE_LIMIT_UPLOAD = os.getenv("RATE_LIMIT_UPLOAD", "30/minute")
+# 令牌签发限流：令牌本身短时有效，但签发接口会分配随机值并写登记表，
+# 无限流的话可被刷出内存增长（每条 256 位 + 元数据），按密钥限频兜底
+RATE_LIMIT_TOKEN = os.getenv("RATE_LIMIT_TOKEN", "30/minute")
 
 
 def _rate_limit_key(request: Request) -> str:
@@ -155,14 +160,25 @@ def composite_task_key(user_id: str, thread_id: str) -> str:
 
 async def require_principal_for_link(
     x_api_key: str | None = Header(default=None, alias="X-API-Key"),
+    token: str | None = None,
     api_key: str | None = None,
 ) -> Principal:
     """
-    浏览器直链（下载、WebSocket）无法自定义请求头时的认证依赖：
-    优先 X-API-Key 请求头，缺省时回退 api_key 查询参数。
-    查询参数形式的密钥可能出现在访问日志中，属已知取舍（见 PRODUCTION_NOTES）。
+    浏览器直链（下载、WebSocket）的认证依赖，按安全优先级依次尝试：
+
+    1. X-API-Key 请求头（fetch/axios 可带，密钥不进 URL）；
+    2. 短时链接令牌（P1-2，60 秒有效，替代查询参数里的长期密钥）；
+    3. api_key 查询参数——兼容期保留的旧入口，密钥会进访问日志/
+       浏览器历史/Referer，前端已不再发送，计划随 P0-2 移除。
+
+    注意开发模式（未配置 API_KEYS）：三个凭据都为空时经
+    authenticate_api_key 走 ALLOW_DEV_MODE 分支，行为与之前一致。
     """
-    return authenticate_api_key(x_api_key or api_key)
+    if x_api_key:
+        return authenticate_api_key(x_api_key)
+    if token:
+        return resolve_link_token(token)
+    return authenticate_api_key(api_key)
 
 
 def sanitize_filename(filename: str) -> str:
@@ -286,6 +302,22 @@ def _forget_task(thread_id: str, task: asyncio.Task) -> None:
 async def health():
     """健康检查端点，供负载均衡和容器探针使用"""
     return {"status": "ok"}
+
+
+@app.post("/api/token")
+@limiter.limit(lambda: RATE_LIMIT_TOKEN)
+async def create_link_token(
+    request: Request, principal: Principal = Depends(require_principal)
+):
+    """
+    签发短时链接令牌（每密钥限 RATE_LIMIT_TOKEN 次/分钟，P1-2）。
+
+    客户端先经 X-API-Key 请求头认证换取 60 秒令牌，再把它拼进
+    WebSocket 握手 URL——长期密钥不再出现在任何 URL 中，访问日志/
+    浏览器历史里最多留下一个一分钟内失效的随机值。
+    """
+    token, expires_in = issue_link_token(principal.user_id)
+    return {"token": token, "expires_in": expires_in}
 
 
 @app.post("/api/task")
@@ -484,6 +516,10 @@ async def download_file(
     """
     文件下载接口 (File Download)。
 
+    鉴权按安全优先级：X-API-Key 头 > 短时令牌（token 参数）> api_key
+    查询参数（兼容期旧入口）；前端已改为 fetch + 请求头 + blob 下载，
+    正常路径下任何形式的密钥都不会出现在 URL 中。
+
     下载范围由服务端根据「当前租户 + thread_id」决定，path 参数只允许是
     会话目录内的相对路径；resolve 后再做一次收容校验，双保险阻断 ../ 形式
     的路径穿越。其他租户即使传入相同 thread_id 也只会定位到自己的目录。
@@ -511,19 +547,28 @@ async def websocket_endpoint(websocket: WebSocket, thread_id: str):
     """
     WebSocket 实时通讯核心接口 (Real-time Communication)。
 
-    浏览器 WebSocket 无法自定义请求头，因此鉴权密钥经查询参数 api_key 传递；
-    该形式的密钥可能出现在访问日志中，属已知取舍（详见 PRODUCTION_NOTES）。
-    连接建立后按「租户+thread_id」复合键注册，monitor 事件按同一复合键定向
-    推送，保证不同租户即使使用相同 thread_id 也不会收到彼此的执行事件。
+    浏览器 WebSocket 无法自定义请求头，鉴权经短时令牌或查询参数传递（见下方
+    P1-2 说明）。连接建立后按「租户+thread_id」复合键注册，monitor 事件按
+    同一复合键定向推送，保证不同租户即使使用相同 thread_id 也不会收到彼此
+    的执行事件。
 
     P0-3 事件回放：握手可携带 last_seq 查询参数（前端已收到的最大事件序号），
     服务端先从事件库补发 last_seq 之后的差量，再注册实时推送。断线期间的
     事件（含最终答案）不再丢失；不带 last_seq 的首次连接补发最近
     EVENT_REPLAY_LIMIT 条，页面刷新也能恢复上一轮执行轨迹。
+
+    P1-2 鉴权：浏览器无法为 WS 设置请求头，推荐先经 POST /api/token
+    换取 60 秒短时令牌再连接；api_key 查询参数为兼容期旧入口（前端已
+    不再发送）；开发模式（未配置 API_KEYS）无凭据直接放行。
     """
-    # 浏览器无法为 WS 设置 X-API-Key 头，鉴权走查询参数
     try:
-        principal = authenticate_api_key(websocket.query_params.get("api_key"))
+        link_token = websocket.query_params.get("token")
+        if link_token:
+            principal = resolve_link_token(link_token)
+        else:
+            principal = authenticate_api_key(
+                websocket.query_params.get("api_key")
+            )
     except HTTPException:
         # 未 accept 直接 close，Starlette 会以 403 拒绝握手
         await websocket.close(code=1008)

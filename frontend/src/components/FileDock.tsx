@@ -5,8 +5,8 @@ import {
   FileTextOutlined,
   ReloadOutlined
 } from "@ant-design/icons";
-import { Button, Empty, Tooltip } from "antd";
-import { getDownloadUrl } from "../lib/api";
+import { Button, Empty, Tooltip, message } from "antd";
+import { downloadSessionFile } from "../lib/api";
 import type { OutputFile } from "../types";
 
 function formatBytes(value: number): string {
@@ -50,6 +50,17 @@ interface FileDockProps {
 }
 
 export function FileDock({ files, onRefresh, sessionPath }: FileDockProps) {
+  // fetch + 请求头 + blob 下载：密钥不出现在 URL（P1-2），
+  // 失败时经 antd message 提示（如令牌/密钥失效、文件被清理）
+  const handleDownload = async (file: OutputFile) => {
+    try {
+      await downloadSessionFile(file.thread_id, file.path);
+    } catch (error) {
+      const detail = error instanceof Error ? error.message : "下载失败";
+      void message.error(`下载 ${file.name} 失败：${detail}`);
+    }
+  };
+
   return (
     <section className="console-panel file-panel" aria-labelledby="file-title">
       <div className="panel-heading">
@@ -91,8 +102,8 @@ export function FileDock({ files, onRefresh, sessionPath }: FileDockProps) {
                 <Button
                   aria-label={`下载 ${file.name}`}
                   className="icon-button"
-                  href={getDownloadUrl(file.thread_id, file.path)}
                   icon={<DownloadOutlined />}
+                  onClick={() => void handleDownload(file)}
                   shape="circle"
                 />
               </Tooltip>

@@ -21,6 +21,7 @@ WebSocket 推送都以 user_id 隔离，见 server.py 与 main_agent.py。
 import os
 import re
 import secrets
+import time
 from dataclasses import dataclass
 
 from fastapi import Header, HTTPException
@@ -128,3 +129,53 @@ async def require_principal(
 ) -> Principal:
     """FastAPI 依赖：从请求头解析租户身份，供所有业务接口使用"""
     return authenticate_api_key(x_api_key)
+
+
+# ---------------------------------------------------------------------------
+# 短时链接令牌（P1-2）
+# ---------------------------------------------------------------------------
+
+# 进程内令牌登记表 {token: (user_id, 过期时刻)}。
+# 单进程部署足够；多副本时令牌状态需外置到 Redis（与 P0-2 任务队列同批），
+# 届时本表的读写语义不变，只换存储。
+_link_tokens: dict[str, tuple[str, float]] = {}
+
+
+def issue_link_token(user_id: str) -> tuple[str, int]:
+    """
+    为已认证租户签发短时链接令牌，用于无法自定义请求头的场景（WS 握手）。
+
+    为什么不用一次性令牌：下载可能因网络失败重试，一次作废会把可恢复的
+    失败变成用户可见的错误；60 秒 TTL 已把暴露窗口压到足够小。
+    TTL 每次调用重读环境变量（与 load_api_keys 同风格，便于测试注入）。
+
+    :return: (令牌字符串, 有效期秒数)
+    """
+    ttl = int(os.getenv("LINK_TOKEN_TTL_SECONDS", "60"))
+    now = time.monotonic()
+    # 顺手清理过期项：令牌签发是低频操作，线性清理成本可忽略，防长期运行膨胀
+    for stale in [t for t, (_, exp) in _link_tokens.items() if exp <= now]:
+        _link_tokens.pop(stale, None)
+
+    token = secrets.token_urlsafe(32)
+    _link_tokens[token] = (user_id, now + ttl)
+    return token, ttl
+
+
+def resolve_link_token(token: str | None) -> Principal:
+    """
+    校验短时链接令牌并返回所属租户身份
+
+    无效与过期统一返回 401 且不区分原因——令牌是 256 位随机值，
+    不给探测方提供"这个令牌曾经存在"的信息。
+
+    :raises HTTPException: 401 令牌缺失/无效/过期
+    """
+    if token:
+        entry = _link_tokens.get(token)
+        # 查表用哈希定位而非逐个比较：令牌是高熵随机值，无前缀可猜，
+        # 字典查找的时序差异不构成可利用的侧信道
+        if entry is not None and entry[1] > time.monotonic():
+            return Principal(user_id=entry[0])
+
+    raise HTTPException(status_code=401, detail="无效或已过期的链接令牌，请重新获取")

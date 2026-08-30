@@ -16,12 +16,13 @@
 | UNION 等集合操作补 LIMIT + 测试数同步 | ✅ 已提交 | `3ccd40b` |
 | 评测集最小版 + P0-2/P0-3 设计方案 | ✅ 已提交 | `9f04b45` |
 | 第四批：P0-3 事件回放 + 审查修复 + P1-4 任务硬超时 | ✅ 已提交 | `6b4a5dc` |
-| P1-4a：单任务 token 预算熔断 | ✅ 已完成，**未提交** | 本轮增量 |
-| 面试文档（5 份） | ✅ 已同步（147 测试） | — |
+| P1-4a：单任务 token 预算熔断 | ✅ 已提交 | `f741fb6` |
+| P1-2：短时链接令牌（密钥不进 URL） | ✅ 已完成，**未提交** | 本轮增量 |
+| 面试文档（5 份） | ✅ 已同步（154 测试） | — |
 
 ---
 
-## 二、第四批改动清单（P0-3 事件回放 + 审查修复 + P1-4 硬超时，已提交 6b4a5dc；P1-4a token 预算为本轮未提交增量）
+## 二、第四批改动清单（P0-3 事件回放 + 审查修复 + P1-4 硬超时已提交 6b4a5dc；P1-4a token 预算 f741fb6；P1-2 短时令牌为本轮未提交增量）
 
 ### 2.1 改动内容
 
@@ -35,8 +36,15 @@
 | `tests/test_event_replay.py`（新增） | 14 用例 | 存储层（seq/差量/隔离/裁剪/重启可读/并发有序）、monitor 落库、WS 补发协议、租户回放隔离 |
 | `app/agent/main_agent.py` | P1-4 硬超时 + P1-4a token 预算 | 流式消费抽为 `_consume_agent_stream`，`asyncio.wait_for(TASK_TIMEOUT_SECONDS=600)` 包住整个执行（含初始化）；流内累计 `usage_metadata`，超 `MODEL_TOKEN_RUN_LIMIT`（默认 150 万）熔断终止 |
 | `tests/test_checkpointer.py` | +4 用例 | 任务超时 2（挂起终止上报、初始化覆盖）+ token 预算 2（超限熔断、预算内含兜底求和） |
-| `tests/conftest.py` | 环境隔离 | `EVENT_DB` 指向系统临时目录，测试不写真实 `app/data/` |
-| `pyproject.toml` / `.env.example` / `.gitignore` | 配套 | 显式声明 `aiosqlite`；新增事件回放 3 个 + `TASK_TIMEOUT_SECONDS` 环境变量；忽略本地 pnpm store |
+| `tests/conftest.py` | 环境隔离 | `EVENT_DB` 指向系统临时目录，测试不写真实 `app/data/`；令牌限流测试默认放开 |
+| `pyproject.toml` / `.env.example` / `.gitignore` | 配套 | 显式声明 `aiosqlite`；新增事件回放 3 个 + `TASK_TIMEOUT_SECONDS`/`MODEL_TOKEN_RUN_LIMIT`/`LINK_TOKEN_TTL_SECONDS`/`RATE_LIMIT_TOKEN` 环境变量；忽略本地 pnpm store |
+
+**P1-2 短时链接令牌（本轮未提交增量）**：消除"API Key 经查询参数传输"的已知取舍——
+
+- `POST /api/token`（请求头认证 + 限流）签发 60 秒令牌；WS 握手改用令牌；
+- 下载改 fetch + 请求头 + blob（密钥彻底不进 URL）；
+- 令牌归属签发租户，隔离与密钥一致；`api_key` 查询参数保留为兼容旧入口（前端已不发送）；
+- 验证：`test_auth.py::TestLinkTokens` 7 个用例。
 
 **第四批代码审查修复**（对上述增量做正式审查后）：
 
@@ -50,7 +58,7 @@
 
 ### 2.2 验证结果
 
-- 后端：**147 个用例全部通过**（原 129 + 事件回放 14 + 任务超时 2 + token 预算 2，`.venv/Scripts/python.exe -m pytest tests/ -q`，约 7 秒）
+- 后端：**154 个用例全部通过**（原 129 + 事件回放 14 + 任务超时 2 + token 预算 2 + 链接令牌 7，`.venv/Scripts/python.exe -m pytest tests/ -q`，约 7 秒）
 - 前端：`tsc -b` 零错误（注：`frontend/node_modules` 因项目目录迁移 junction 失效，已用 `pnpm install --store-dir ./.pnpm-store-local` 重装修复）
 
 ### 2.3 已知边界（如实标注）
@@ -69,11 +77,11 @@
 | `tests/test_path_safety.py` | 14 | 路径穿越防御 |
 | `tests/test_sql_guard.py` | 45 | SQL 只读 + 自动 LIMIT + UNION |
 | `tests/test_api_security.py` | 31 | 上传安全 + 会话隔离 + 回滚 |
-| `tests/test_auth.py` | 28 | API Key 认证 + fail-closed + 非 ASCII |
+| `tests/test_auth.py` | 35 | API Key 认证 + fail-closed + 非 ASCII + 短时链接令牌 |
 | `tests/test_rate_limit.py` | 7 | slowapi 限流 |
 | `tests/test_checkpointer.py` | 8 | SQLite 持久化 + middleware 透传 + 任务硬超时 + token 预算 |
 | `tests/test_event_replay.py` | 14 | 事件回放（存储/落库/补发协议/租户隔离/并发有序） |
-| **合计** | **147** | — |
+| **合计** | **154** | — |
 
 ---
 
@@ -81,10 +89,9 @@
 
 | 优先级 | 任务 | 状态 |
 |--------|------|------|
-| **P0** | Git 提交 P1-4a token 预算熔断 | 待提交 |
+| **P0** | Git 提交 P1-2 短时链接令牌 | 待提交 |
 | **P0** | P0-2 任务出进程（ARQ + Redis + Postgres，设计方案已写好） | 未实现 |
-| **P1** | 短时一次性令牌替代查询参数密钥（P1-2） | 未实现 |
-| **P1** | 工具网络重试（tenacity）；token 会话级累计预算（run 级已完成） | 未实现 |
+| **P1** | 工具网络重试（tenacity）；token 会话级累计预算（run 级已完成）；移除 api_key 兼容入口 | 未实现 |
 | **P2** | 评测集扩到 50 条接 CI；可观测性（结构化日志/OTel）；事件库 TTL 清理 | 长期 |
 
 ---

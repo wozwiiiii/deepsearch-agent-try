@@ -238,3 +238,75 @@ class TestWebSocketAuth:
         with pytest.raises(WebSocketDisconnect):
             with client.websocket_connect("/ws/../escape"):
                 pass
+
+
+class TestLinkTokens:
+    """P1-2 短时链接令牌：签发需头认证、回环鉴权、过期/伪造拒绝、租户归属"""
+
+    def test_token_endpoint_requires_header_auth(self, client, monkeypatch):
+        monkeypatch.setenv("API_KEYS", f"alice:{ALICE_KEY}")
+        # 无凭据 → 401；错误密钥 → 401（签发接口不开放查询参数认证）
+        assert client.post("/api/token").status_code == 401
+        assert client.post("/api/token", headers={"X-API-Key": "sk-nope"}).status_code == 401
+
+    def test_token_roundtrip_via_ws(self, client, monkeypatch):
+        monkeypatch.setenv("API_KEYS", f"alice:{ALICE_KEY}")
+        response = client.post("/api/token", headers=ALICE_HEADERS)
+        assert response.status_code == 200
+        body = response.json()
+        assert body["expires_in"] > 0
+        # 令牌换取的 WS 握手与 api_key 等价
+        with client.websocket_connect(f"/ws/t-tok-1?token={body['token']}") as ws:
+            ws.send_text("ping")
+            assert ws.receive_json()["type"] == "pong"
+
+    def test_token_roundtrip_via_download(self, client, monkeypatch):
+        monkeypatch.setenv("API_KEYS", f"alice:{ALICE_KEY}")
+        TestTenantIsolation()._prepare_file("t-tok-dl")
+        token = client.post("/api/token", headers=ALICE_HEADERS).json()["token"]
+        response = client.get(
+            "/api/download",
+            params={"thread_id": "t-tok-dl", "path": "secret.md", "token": token},
+        )
+        assert response.status_code == 200
+
+    def test_token_binds_to_issuing_tenant(self, client, monkeypatch):
+        """令牌归属签发者：bob 的有效令牌也只定位到 bob 自己的目录（隔离不因令牌失效）"""
+        monkeypatch.setenv("API_KEYS", f"alice:{ALICE_KEY},bob:{BOB_KEY}")
+        TestTenantIsolation()._prepare_file("t-tok-iso")
+        alice_token = client.post("/api/token", headers=ALICE_HEADERS).json()["token"]
+        # alice 的令牌归属 alice：可下载自己的文件
+        ok = client.get(
+            "/api/download",
+            params={"thread_id": "t-tok-iso", "path": "secret.md", "token": alice_token},
+        )
+        assert ok.status_code == 200
+        # bob 的令牌同样有效，但同一 thread_id 只会定位到 bob 的目录（不存在 → 404）
+        bob_token = client.post("/api/token", headers=BOB_HEADERS).json()["token"]
+        bob_via_own = client.get(
+            "/api/download",
+            params={"thread_id": "t-tok-iso", "path": "secret.md", "token": bob_token},
+        )
+        assert bob_via_own.status_code == 404
+
+    def test_expired_token_rejected(self, client, monkeypatch):
+        monkeypatch.setenv("API_KEYS", f"alice:{ALICE_KEY}")
+        # TTL=0：签发即过期（issue_link_token 每次调用重读环境变量）
+        monkeypatch.setenv("LINK_TOKEN_TTL_SECONDS", "0")
+        token = client.post("/api/token", headers=ALICE_HEADERS).json()["token"]
+        with pytest.raises(WebSocketDisconnect):
+            with client.websocket_connect(f"/ws/t-tok-exp?token={token}"):
+                pass
+
+    def test_garbage_token_rejected(self, client, monkeypatch):
+        monkeypatch.setenv("API_KEYS", f"alice:{ALICE_KEY}")
+        with pytest.raises(WebSocketDisconnect):
+            with client.websocket_connect("/ws/t-tok-bad?token=forged-token-value"):
+                pass
+
+    def test_api_key_query_param_still_accepted(self, client, monkeypatch):
+        """兼容期旧入口不回归：api_key 查询参数仍可完成 WS 握手"""
+        monkeypatch.setenv("API_KEYS", f"alice:{ALICE_KEY}")
+        with client.websocket_connect(f"/ws/t-tok-compat?api_key={ALICE_KEY}") as ws:
+            ws.send_text("ping")
+            assert ws.receive_json()["type"] == "pong"

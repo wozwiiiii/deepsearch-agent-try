@@ -21,6 +21,7 @@ os.environ.setdefault("ALLOW_DEV_MODE", "1")
 # 限流阈值在 server.py 导入时读取；测试默认放开，限流专项用例单独调小
 os.environ.setdefault("RATE_LIMIT_TASK", "1000/minute")
 os.environ.setdefault("RATE_LIMIT_UPLOAD", "1000/minute")
+os.environ.setdefault("RATE_LIMIT_TOKEN", "1000/minute")
 # 事件回放库（event_store 惰性初始化时读取）：整个测试会话指向系统临时目录，
 # 避免 WS 用例在真实运行时目录 app/data/ 下建库写文件（与 R-4 同一原则）
 os.environ.setdefault(

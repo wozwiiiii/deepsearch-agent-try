@@ -1,5 +1,11 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
-import { cancelTask, listSessionFiles, startTask, uploadSessionFiles } from "../lib/api";
+import {
+  cancelTask,
+  fetchLinkToken,
+  listSessionFiles,
+  startTask,
+  uploadSessionFiles
+} from "../lib/api";
 import { API_KEY, WS_BASE_URL } from "../lib/config";
 import { createThreadId, getStoredThreadId, storeThreadId } from "../lib/thread";
 import type {
@@ -93,20 +99,31 @@ export function useDeepAgentSession() {
     // 新 thread 即新事件流，旧 seq 在新流中无意义
     lastSeqRef.current = undefined;
 
-    function connect() {
+    async function connect() {
       clearSocketTimers();
       const hadSocket = Boolean(socketRef.current);
       socketRef.current?.close();
       setConnectionState(hadSocket ? "reconnecting" : "connecting");
 
-      // 浏览器 WS 无法自定义请求头，鉴权密钥经查询参数传递；
-      // 已收过事件时附带 last_seq，服务端据此做断线差量补发
+      // 浏览器 WS 无法自定义请求头：先经请求头认证换 60 秒短时令牌，
+      // 长期密钥不再出现在 URL（P1-2）；已收过事件时附带 last_seq
+      // 供服务端做断线差量补发
       const params = new URLSearchParams();
       if (API_KEY) {
-        params.set("api_key", API_KEY);
+        try {
+          const { token } = await fetchLinkToken();
+          params.set("token", token);
+        } catch {
+          // 令牌服务不可用（如后端未升级）时回退兼容入口：
+          // 查询参数密钥，已弃用，仅保底不断连
+          params.set("api_key", API_KEY);
+        }
       }
       if (lastSeqRef.current !== undefined) {
         params.set("last_seq", String(lastSeqRef.current));
+      }
+      if (disposed) {
+        return;
       }
       const query = params.toString();
       const wsUrl = `${WS_BASE_URL}/ws/${encodeURIComponent(threadId)}${query ? `?${query}` : ""}`;

@@ -8,7 +8,7 @@
 > - 第一批（安全加固）：路径穿越、SQL 只读、上传限制、横向越权、CORS 等 7 类问题
 > - 第二批（认证与状态）：API Key 认证 + 多租户隔离 + SQLite 持久化 checkpointer
 > - 第三批（限流与成本）：slowapi 按密钥限流 + fail-closed 开发模式 + 模型调用硬上限
-> - 第四批（P0-3 事件回放 + P1-4 可靠性与成本）：SQLite 事件库 + seq 序号 + last_seq 差量补发 + 前端指数退避；`TASK_TIMEOUT_SECONDS` 任务级硬超时；`MODEL_TOKEN_RUN_LIMIT` 单任务 token 预算熔断
+> - 第四批（P0-3 事件回放 + P1-4 可靠性与成本 + P1-2 短时令牌）：SQLite 事件库 + seq 序号 + last_seq 差量补发 + 前端指数退避；`TASK_TIMEOUT_SECONDS` 任务级硬超时；`MODEL_TOKEN_RUN_LIMIT` 单任务 token 预算熔断；`POST /api/token` 短时链接令牌消除"密钥进 URL"取舍
 > - 审查修复：第三批后审查修复 4 项（上传总量限制、失败回滚、测试隔离、非 ASCII 密钥）；第四批后审查修复 3 项（前端补发预算烧穿、差量补发截断、双 commit）+ 清理死代码 1 项
 
 ## 一、已完成的修复
@@ -157,6 +157,17 @@
 
 审查中证伪的怀疑（记录结论不修）：`asyncio.Lock` 跨事件循环绑定——探针实证 3.12 无争用快路径不绑定循环，生产单循环且测试无并发争用，不成立。
 
+### 14. 短时链接令牌（`auth.py` + `server.py` + 前端，P1-2）
+
+- **原问题**：浏览器 WebSocket 和下载直链无法自定义请求头，第二批只能把长期 API Key 拼进 URL 查询参数——密钥会进 nginx/uvicorn 访问日志、浏览器历史、Referer 头（当时的已知取舍）。
+- **修复**（消除该取舍，分两条路径按泄漏面最小化设计）：
+  - **下载（泄漏面归零）**：前端改为 `fetch` + `X-API-Key` 请求头 + blob 下载（`downloadSessionFile`），任何形式的凭据都不再出现在下载 URL 中；
+  - **WS 握手（无法带请求头，缩短暴露窗口）**：新增 `POST /api/token`（请求头认证，限 `RATE_LIMIT_TOKEN` 30 次/分钟），签发 60 秒短时令牌（`LINK_TOKEN_TTL_SECONDS` 可配，`secrets.token_urlsafe(32)`），前端每次连接前换取、拼进握手 URL——访问日志里最多留下一个一分钟内失效的随机值；
+  - 令牌归属签发者 user_id，租户隔离与密钥一致（bob 的有效令牌也只定位到 bob 的目录）；
+  - `api_key` 查询参数保留为兼容期旧入口（前端已不再发送，计划随 P0-2 移除）——增量迁移而非一刀切，旧客户端不断连。
+- **设计取舍（如实说明）**：① 令牌是 TTL 制而非一次性——下载可能因网络失败重试，一次作废会把可恢复失败变成用户可见错误；② 令牌登记表在进程内（`_link_tokens` dict），多副本部署需外置 Redis（与 P0-2 同批，读写语义不变）；③ 无效与过期统一 401 不区分原因，不给探测方提供"令牌曾存在"的信息。
+- **验证**：`tests/test_auth.py::TestLinkTokens`（7 个用例：签发需头认证、WS/下载回环、令牌租户归属、过期拒绝（TTL=0 注入）、伪造拒绝、api_key 兼容不回归）。
+
 ## 五、代码审查修复（2026-08-17）
 
 对前三批全部增量做正式代码审查后修复的 4 项：
@@ -173,8 +184,8 @@
 ## 六、如何验证
 
 ```bash
-# 后端全部测试（147 个用例：安全 90 + 认证/租户/限流 35 + 持久化/超时/预算 8 + 事件回放 14）
-# 分布：path_safety 14 / sql_guard 45 / api_security 31 / auth 28 / rate_limit 7 / checkpointer 8 / event_replay 14
+# 后端全部测试（154 个用例：安全 90 + 认证/租户/令牌/限流 42 + 持久化/超时/预算 8 + 事件回放 14）
+# 分布：path_safety 14 / sql_guard 45 / api_security 31 / auth 35 / rate_limit 7 / checkpointer 8 / event_replay 14
 uv sync --group dev
 uv run pytest tests/ -q
 
@@ -191,12 +202,12 @@ cd frontend && pnpm install && pnpm exec tsc -b
 3. **评测体系**：~~固定评测集~~（最小版已建：`eval/` 20 用例 + 确定性判分 + LLM-as-judge）；待扩到 50 条并接 CI 做回归。这是 Agent 项目区别于 demo 的核心证据。
 4. **CI/CD**：GitHub Actions（lint + pytest + tsc + build），pre-commit 已有配置需补齐 ruff/mypy 钩子；后端目前无 Dockerfile（只有 MySQL compose），需补多阶段构建镜像。
 5. **内容安全**：上传文件病毒扫描（ClamAV）、模型输出审核（涉政/敏感词）、提示注入防护（系统提示与用户输入隔离、工具结果标记为不可信数据）。
-6. **认证升级路径**：当前 API Key 适合个人/小团队部署；对外多用户产品需换 OIDC（Authing / Casdoor / Auth0）+ JWT，密钥轮换与吊销机制（短时一次性令牌替代查询参数密钥）。
+6. **认证升级路径**：当前 API Key 适合个人/小团队部署；对外多用户产品需换 OIDC（Authing / Casdoor / Auth0）+ JWT。~~短时令牌替代查询参数密钥~~（P1-2 已完成：WS 用 60 秒令牌、下载走请求头，`api_key` 查询参数仅剩兼容期旧入口待移除）；密钥轮换与吊销机制仍待做。
 
 ## 八、与上游教学版的关系
 
 本仓库基于开源教学项目 deepsearch-agents（MIT 协议）。简历与面试中的正确定位是：
 "基于开源教学项目做了**生产化改造**：四批改造 + 两次正式代码审查修复，覆盖路径穿越、
-SQL 任意执行、横向越权、无认证、租户串台、无限流、事件不可回放、任务无超时等 16 类问题，147 个回归测试"——
+SQL 任意执行、横向越权、无认证、租户串台、无限流、事件不可回放、任务无超时等 16 类问题，154 个回归测试"——
 而不是把整个项目说成从零自研。
 能逐条讲清楚"原版哪里有洞、我怎么修的、怎么验证的"，比笼统的"独立开发"更可信。
