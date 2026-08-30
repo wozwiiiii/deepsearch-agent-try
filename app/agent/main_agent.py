@@ -63,6 +63,14 @@ MODEL_THREAD_LIMIT = int(os.getenv("MODEL_THREAD_LIMIT", "300"))
 # 超时取消内部执行流并经 monitor 告知前端；默认 600 秒，可用环境变量调整
 TASK_TIMEOUT_SECONDS = float(os.getenv("TASK_TIMEOUT_SECONDS", "600"))
 
+# 单次任务 token 预算（P1-4a 成本熔断）：调用次数上限（MODEL_RUN_LIMIT=80）
+# 不约束单次上下文长度——单任务理论消耗可达 80×32K≈256 万 token 无上限。
+# 此处按流式返回的 usage_metadata 累计，超预算立即终止任务。
+# 默认 150 万：允许 80 次接近满窗的调用（成本上限 ≈ 理论上限的 60%），
+# 同时拦截"少数超长调用 + 失控循环"的组合。会话级（跨任务累计）预算
+# 需读 checkpoint 历史，暂未实现（见 PRODUCTION_NOTES 边界）。
+MODEL_TOKEN_RUN_LIMIT = int(os.getenv("MODEL_TOKEN_RUN_LIMIT", "1500000"))
+
 # 主智能体是调度中心：
 # 1. tools 只放最终交付相关的文件工具
 # 2. subagents 放网络、数据库、RAGFlow 三类信息获取助手
@@ -133,6 +141,10 @@ async def _consume_agent_stream(agent_factory, message: str, config: dict) -> No
     # （超时同样覆盖初始化阶段，防数据库异常挂起）
     agent = await agent_factory()
 
+    # 单次任务 token 累计（P1-4a）：按模型消息的 usage_metadata 求和。
+    # 部分供应商不回传 usage，此时该机制静默失效（边界见 PRODUCTION_NOTES）
+    tokens_used = 0
+
     # astream 会持续产出模型节点、工具节点和子智能体节点的状态片段
     async for chunk in agent.astream(
         {"messages": [{"role": "user", "content": message}]},
@@ -144,6 +156,20 @@ async def _consume_agent_stream(agent_factory, message: str, config: dict) -> No
                 continue
             messages = state["messages"]
             if messages and isinstance(messages, list):
+                # 熔断检查放在处理消息之前：预算已超时立即停止，不再多消费一轮
+                if tokens_used > MODEL_TOKEN_RUN_LIMIT:
+                    raise RuntimeError(
+                        f"单次任务 token 消耗 {tokens_used} 已超过预算上限 "
+                        f"{MODEL_TOKEN_RUN_LIMIT}，任务终止"
+                    )
+                for msg in messages:
+                    usage = getattr(msg, "usage_metadata", None)
+                    if usage:
+                        # total_tokens 缺失时按 input+output 兜底
+                        tokens_used += usage.get("total_tokens") or (
+                            usage.get("input_tokens", 0)
+                            + usage.get("output_tokens", 0)
+                        )
                 last_msg = messages[-1]
                 if node_name == "model":
                     if last_msg.tool_calls:

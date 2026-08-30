@@ -8,7 +8,7 @@
 > - 第一批（安全加固）：路径穿越、SQL 只读、上传限制、横向越权、CORS 等 7 类问题
 > - 第二批（认证与状态）：API Key 认证 + 多租户隔离 + SQLite 持久化 checkpointer
 > - 第三批（限流与成本）：slowapi 按密钥限流 + fail-closed 开发模式 + 模型调用硬上限
-> - 第四批（P0-3 事件回放 + P1-4 任务硬超时）：SQLite 事件库 + seq 序号 + last_seq 差量补发 + 前端指数退避；`TASK_TIMEOUT_SECONDS` 任务级硬超时
+> - 第四批（P0-3 事件回放 + P1-4 可靠性与成本）：SQLite 事件库 + seq 序号 + last_seq 差量补发 + 前端指数退避；`TASK_TIMEOUT_SECONDS` 任务级硬超时；`MODEL_TOKEN_RUN_LIMIT` 单任务 token 预算熔断
 > - 审查修复：第三批后审查修复 4 项（上传总量限制、失败回滚、测试隔离、非 ASCII 密钥）；第四批后审查修复 3 项（前端补发预算烧穿、差量补发截断、双 commit）+ 清理死代码 1 项
 
 ## 一、已完成的修复
@@ -131,11 +131,18 @@
 - **已知边界**：补发读取与实时注册之间存在毫秒级窗口，期间事件由前端 seq 跳号检测兜底（主动补发恢复）；WS 背压下推送顺序与 seq 顺序理论上可倒置（append 与 send 之间有让步点），同样由前端跳号检测→补发闭环自愈——协议把顺序视为不可信、以 seq 为准；多副本部署仍需 P0-2（事件广播），本批只解决单进程内的持久化与回放；设计稿的"任务结束 30 分钟后删除 Stream"未实现（只有 MAXLEN 条数裁剪，events 表随会话数增长，待办）。
 - **验证**：`tests/test_event_replay.py`（14 个用例：seq 递增与 payload 结构、差量读取、task_key 流隔离、裁剪保留最近 N 条、新实例读回等价重启、monitor 落库携带 seq、last_seq 差量补发、首次连接恢复、实时事件带 seq、非法 last_seq 拒绝、跨租户回放隔离、差量全量补发不受 replay_limit 截断、并发 append 序号唯一有序）。
 
-### 12. 任务级硬超时（`main_agent.py`，P1-4 的超时部分）
+### 12. 任务级硬超时与 token 预算熔断（`main_agent.py`，P1-4）
 
+**硬超时**：
 - **原问题**：LLM API 网络半开挂起时任务永远停在"运行中"——前端一直转圈、占用模型调用预算、普通取消难以打断；`run_deep_agent` 无外层超时。
 - **修复**：流式消费逻辑抽取为 `_consume_agent_stream`，整个执行（含 Agent 惰性初始化）包在 `asyncio.wait_for(..., timeout=TASK_TIMEOUT_SECONDS)` 内，默认 600 秒可配。超时先取消内部协程再抛 `TimeoutError`，由 `run_deep_agent` 捕获并经 monitor 告知前端（错误事件同样落事件库、断线可回放）；用户主动取消仍走 `CancelledError` 分支。
 - **验证**：`tests/test_checkpointer.py::TestTaskTimeout`（2 个用例：astream 挂起被超时终止并上报、初始化挂起同样被覆盖）。
+
+**token 预算熔断（P1-4a）**：
+- **原问题**：调用次数上限（run=80）不约束单次上下文长度——单任务理论消耗可达 80×32K≈256 万 token 无上限，是限流/成本治理的最后一块真实缺口。
+- **修复**：流式消费循环内按模型消息的 `usage_metadata` 累计单任务 token（`total_tokens` 缺失时按 `input+output` 兜底），超过 `MODEL_TOKEN_RUN_LIMIT`（默认 150 万 ≈ 理论上限 60%）立即抛异常终止，复用现有异常通道经 monitor 告知前端（错误事件可回放）。熔断检查在片段处理之前，超限后不再多消费一轮。
+- **边界（如实说明）**：① 只统计流中可见的模型消息——子智能体内部调用的 usage 若未随片段上报则不计入；② 供应商不回传 usage_metadata 时该机制静默失效；③ 会话级（跨任务累计）预算需读 checkpoint 历史，未实现。
+- **验证**：`tests/test_checkpointer.py::TestTokenBudget`（2 个用例：累计超限熔断并上报、预算内正常完成含兜底求和）。
 
 ### 13. 第四批代码审查修复（2026-08-30）
 
@@ -166,8 +173,8 @@
 ## 六、如何验证
 
 ```bash
-# 后端全部测试（145 个用例：安全 90 + 认证/租户/限流 35 + 持久化与超时 6 + 事件回放 14）
-# 分布：path_safety 14 / sql_guard 45 / api_security 31 / auth 28 / rate_limit 7 / checkpointer 6 / event_replay 14
+# 后端全部测试（147 个用例：安全 90 + 认证/租户/限流 35 + 持久化/超时/预算 8 + 事件回放 14）
+# 分布：path_safety 14 / sql_guard 45 / api_security 31 / auth 28 / rate_limit 7 / checkpointer 8 / event_replay 14
 uv sync --group dev
 uv run pytest tests/ -q
 
@@ -179,7 +186,7 @@ cd frontend && pnpm install && pnpm exec tsc -b
 
 以下按「上线阻塞性」排序，是诚实的能力边界，也是后续迭代计划：
 
-1. **任务队列与并发治理（上线前必须，唯一剩余 P0）**：当前 `asyncio.create_task` 进程内执行，重启即丢、无法水平扩容；`active_tasks` 是进程内 dict，多 worker 部署下取消接口失效。引入 Celery / ARQ / Temporal，Agent 执行与 API 进程分离，任务状态入 Redis 或数据库，事件广播换 Redis Stream（本批事件存储已按 append/read_after 可替换语义设计，替换只改实现类）。~~限流与成本控制~~（第三批完成）、~~事件回放单机版~~（第四批完成，多副本广播仍需本项）。
+1. **任务队列与并发治理（上线前必须，唯一剩余 P0）**：当前 `asyncio.create_task` 进程内执行，重启即丢、无法水平扩容；`active_tasks` 是进程内 dict，多 worker 部署下取消接口失效。引入 Celery / ARQ / Temporal，Agent 执行与 API 进程分离，任务状态入 Redis 或数据库，事件广播换 Redis Stream（本批事件存储已按 append/read_after 可替换语义设计，替换只改实现类）。~~限流与成本控制~~（第三批完成）、~~事件回放单机版~~（第四批完成，多副本广播仍需本项）、~~token 预算熔断（run 级）~~（第四批完成）。
 2. **可观测性**：`print` 全量替换为结构化日志（logging + JSON formatter），接入 OpenTelemetry trace（LangSmith / LangFuse 追踪 Agent 链路），Prometheus 指标（任务时长、工具失败率、LLM token 消耗）+ 告警。
 3. **评测体系**：~~固定评测集~~（最小版已建：`eval/` 20 用例 + 确定性判分 + LLM-as-judge）；待扩到 50 条并接 CI 做回归。这是 Agent 项目区别于 demo 的核心证据。
 4. **CI/CD**：GitHub Actions（lint + pytest + tsc + build），pre-commit 已有配置需补齐 ruff/mypy 钩子；后端目前无 Dockerfile（只有 MySQL compose），需补多阶段构建镜像。
@@ -190,6 +197,6 @@ cd frontend && pnpm install && pnpm exec tsc -b
 
 本仓库基于开源教学项目 deepsearch-agents（MIT 协议）。简历与面试中的正确定位是：
 "基于开源教学项目做了**生产化改造**：四批改造 + 两次正式代码审查修复，覆盖路径穿越、
-SQL 任意执行、横向越权、无认证、租户串台、无限流、事件不可回放、任务无超时等 16 类问题，145 个回归测试"——
+SQL 任意执行、横向越权、无认证、租户串台、无限流、事件不可回放、任务无超时等 16 类问题，147 个回归测试"——
 而不是把整个项目说成从零自研。
 能逐条讲清楚"原版哪里有洞、我怎么修的、怎么验证的"，比笼统的"独立开发"更可信。

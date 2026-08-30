@@ -15,12 +15,13 @@
 | 第三批：限流 + fail-closed + 模型调用上限 + 审查修复 | ✅ 已提交 | `62f13ab` |
 | UNION 等集合操作补 LIMIT + 测试数同步 | ✅ 已提交 | `3ccd40b` |
 | 评测集最小版 + P0-2/P0-3 设计方案 | ✅ 已提交 | `9f04b45` |
-| 第四批：P0-3 事件回放 + 审查修复 + P1-4 任务硬超时 | ✅ 已完成，**未提交** | 见下节 |
-| 面试文档（5 份） | ✅ 已同步至第四批后状态（145 测试） | — |
+| 第四批：P0-3 事件回放 + 审查修复 + P1-4 任务硬超时 | ✅ 已提交 | `6b4a5dc` |
+| P1-4a：单任务 token 预算熔断 | ✅ 已完成，**未提交** | 本轮增量 |
+| 面试文档（5 份） | ✅ 已同步（147 测试） | — |
 
 ---
 
-## 二、第四批改动清单（P0-3 事件回放 + 审查修复 + P1-4 硬超时，未提交）
+## 二、第四批改动清单（P0-3 事件回放 + 审查修复 + P1-4 硬超时，已提交 6b4a5dc；P1-4a token 预算为本轮未提交增量）
 
 ### 2.1 改动内容
 
@@ -32,8 +33,8 @@
 | `frontend/src/hooks/useDeepAgentSession.ts` | +退避/补发 | 指数退避 + 抖动（2s→60s 上限）；seq 跳号主动重连补发（限 3 次）；补发事件跳过跳号检测；重叠窗口按 seq 去重 |
 | `frontend/src/types.ts` | 类型 | `MonitorMessage` 增加 `seq` / `replay` 字段 |
 | `tests/test_event_replay.py`（新增） | 14 用例 | 存储层（seq/差量/隔离/裁剪/重启可读/并发有序）、monitor 落库、WS 补发协议、租户回放隔离 |
-| `app/agent/main_agent.py` | P1-4 硬超时 | 流式消费抽为 `_consume_agent_stream`，`asyncio.wait_for(TASK_TIMEOUT_SECONDS=600)` 包住整个执行（含初始化）；超时经 monitor 告知前端 |
-| `tests/test_checkpointer.py` | +2 用例 | 任务超时：astream 挂起被终止并上报、初始化挂起同样覆盖 |
+| `app/agent/main_agent.py` | P1-4 硬超时 + P1-4a token 预算 | 流式消费抽为 `_consume_agent_stream`，`asyncio.wait_for(TASK_TIMEOUT_SECONDS=600)` 包住整个执行（含初始化）；流内累计 `usage_metadata`，超 `MODEL_TOKEN_RUN_LIMIT`（默认 150 万）熔断终止 |
+| `tests/test_checkpointer.py` | +4 用例 | 任务超时 2（挂起终止上报、初始化覆盖）+ token 预算 2（超限熔断、预算内含兜底求和） |
 | `tests/conftest.py` | 环境隔离 | `EVENT_DB` 指向系统临时目录，测试不写真实 `app/data/` |
 | `pyproject.toml` / `.env.example` / `.gitignore` | 配套 | 显式声明 `aiosqlite`；新增事件回放 3 个 + `TASK_TIMEOUT_SECONDS` 环境变量；忽略本地 pnpm store |
 
@@ -49,7 +50,7 @@
 
 ### 2.2 验证结果
 
-- 后端：**145 个用例全部通过**（原 129 + 事件回放 14 + 任务超时 2，`.venv/Scripts/python.exe -m pytest tests/ -q`，约 9 秒）
+- 后端：**147 个用例全部通过**（原 129 + 事件回放 14 + 任务超时 2 + token 预算 2，`.venv/Scripts/python.exe -m pytest tests/ -q`，约 7 秒）
 - 前端：`tsc -b` 零错误（注：`frontend/node_modules` 因项目目录迁移 junction 失效，已用 `pnpm install --store-dir ./.pnpm-store-local` 重装修复）
 
 ### 2.3 已知边界（如实标注）
@@ -70,9 +71,9 @@
 | `tests/test_api_security.py` | 31 | 上传安全 + 会话隔离 + 回滚 |
 | `tests/test_auth.py` | 28 | API Key 认证 + fail-closed + 非 ASCII |
 | `tests/test_rate_limit.py` | 7 | slowapi 限流 |
-| `tests/test_checkpointer.py` | 6 | SQLite 持久化 + middleware 透传 + 任务硬超时 |
+| `tests/test_checkpointer.py` | 8 | SQLite 持久化 + middleware 透传 + 任务硬超时 + token 预算 |
 | `tests/test_event_replay.py` | 14 | 事件回放（存储/落库/补发协议/租户隔离/并发有序） |
-| **合计** | **145** | — |
+| **合计** | **147** | — |
 
 ---
 
@@ -80,10 +81,10 @@
 
 | 优先级 | 任务 | 状态 |
 |--------|------|------|
-| **P0** | Git 提交第四批改动（事件回放 + 审查修复 + 硬超时） | 待提交 |
+| **P0** | Git 提交 P1-4a token 预算熔断 | 待提交 |
 | **P0** | P0-2 任务出进程（ARQ + Redis + Postgres，设计方案已写好） | 未实现 |
 | **P1** | 短时一次性令牌替代查询参数密钥（P1-2） | 未实现 |
-| **P1** | 工具网络重试（tenacity）+ token 级预算熔断（P1-4 残余；硬超时已完成） | 未实现 |
+| **P1** | 工具网络重试（tenacity）；token 会话级累计预算（run 级已完成） | 未实现 |
 | **P2** | 评测集扩到 50 条接 CI；可观测性（结构化日志/OTel）；事件库 TTL 清理 | 长期 |
 
 ---

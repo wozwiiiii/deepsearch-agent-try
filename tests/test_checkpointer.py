@@ -176,3 +176,94 @@ class TestTaskTimeout:
         asyncio.run(main_agent_module.run_deep_agent("查询任务", "t-timeout-2", "local"))
 
         assert any("硬超时" in message for message in stub_monitor.errors)
+
+
+class TestTokenBudget:
+    """P1-4a token 预算熔断：单次任务累计超预算立即终止并告知前端"""
+
+    @staticmethod
+    def _chunk(total_tokens: int, content: str = "ok"):
+        """构造 astream 的模型节点更新片段，携带 usage_metadata"""
+        from langchain_core.messages import AIMessage
+
+        message = AIMessage(
+            content=content,
+            usage_metadata={
+                "input_tokens": total_tokens - 10,
+                "output_tokens": 10,
+                "total_tokens": total_tokens,
+            },
+        )
+        return {"model": {"messages": [message]}}
+
+    def test_run_aborts_when_token_budget_exceeded(self, tmp_path, monkeypatch):
+        """累计 120 > 预算 100：第三轮片段处理前熔断，错误经 monitor 上报"""
+
+        class _BudgetBurningAgent:
+            async def astream(self, *args, **kwargs):
+                # 每轮 60 token；第三轮处理前累计 120 已超预算 100
+                for _ in range(5):
+                    yield self._chunk(60)
+
+            _chunk = staticmethod(TestTokenBudget._chunk)
+
+        async def _fake_get_agent():
+            return _BudgetBurningAgent()
+
+        stub_monitor = _RecordingMonitor()
+        monkeypatch.setattr(main_agent_module, "project_root_path", tmp_path)
+        monkeypatch.setattr(main_agent_module, "MODEL_TOKEN_RUN_LIMIT", 100)
+        monkeypatch.setattr(main_agent_module, "_get_agent", _fake_get_agent)
+        monkeypatch.setattr(main_agent_module, "monitor", stub_monitor)
+
+        asyncio.run(main_agent_module.run_deep_agent("查询任务", "t-budget-1", "local"))
+
+        assert any("token" in message for message in stub_monitor.errors), (
+            f"应上报 token 预算熔断，实际收到: {stub_monitor.errors}"
+        )
+
+    def test_run_completes_within_budget_with_fallback_sum(self, tmp_path, monkeypatch):
+        """预算内正常完成；total_tokens 缺失时按 input+output 兜底累计"""
+
+        from langchain_core.messages import AIMessage
+
+        class _PartialUsageMessage:
+            """非标准消息：usage_metadata 无 total_tokens（LangChain 的 AIMessage
+            会强制校验该字段，缺失场景只能用自定义对象模拟）"""
+
+            content = "done"
+            tool_calls = []
+            usage_metadata = {"input_tokens": 30, "output_tokens": 5}
+
+        class _NormalAgent:
+            async def astream(self, *args, **kwargs):
+                # 第一条带完整 usage；第二条走 input+output 兜底求和
+                yield {
+                    "model": {
+                        "messages": [
+                            AIMessage(
+                                content="ok",
+                                usage_metadata={
+                                    "input_tokens": 20,
+                                    "output_tokens": 5,
+                                    "total_tokens": 25,
+                                },
+                            )
+                        ]
+                    }
+                }
+                yield {"model": {"messages": [_PartialUsageMessage()]}}
+
+        async def _fake_get_agent():
+            return _NormalAgent()
+
+        stub_monitor = _RecordingMonitor()
+        monkeypatch.setattr(main_agent_module, "project_root_path", tmp_path)
+        monkeypatch.setattr(main_agent_module, "MODEL_TOKEN_RUN_LIMIT", 100)
+        monkeypatch.setattr(main_agent_module, "_get_agent", _fake_get_agent)
+        monkeypatch.setattr(main_agent_module, "monitor", stub_monitor)
+
+        asyncio.run(main_agent_module.run_deep_agent("查询任务", "t-budget-2", "local"))
+
+        # 25 + 35 = 60 < 100：不熔断、无错误，任务正常结束
+        assert stub_monitor.errors == []
