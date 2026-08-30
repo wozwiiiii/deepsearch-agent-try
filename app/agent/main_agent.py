@@ -58,6 +58,11 @@ CHECKPOINT_DB = os.getenv(
 MODEL_RUN_LIMIT = int(os.getenv("MODEL_RUN_LIMIT", "80"))
 MODEL_THREAD_LIMIT = int(os.getenv("MODEL_THREAD_LIMIT", "300"))
 
+# 任务级硬超时（P1-4 可靠性）：LLM API 网络半开挂起时任务会永远停在
+# "运行中"（前端一直转圈、占用模型调用预算、无法被普通取消打断）。
+# 超时取消内部执行流并经 monitor 告知前端；默认 600 秒，可用环境变量调整
+TASK_TIMEOUT_SECONDS = float(os.getenv("TASK_TIMEOUT_SECONDS", "600"))
+
 # 主智能体是调度中心：
 # 1. tools 只放最终交付相关的文件工具
 # 2. subagents 放网络、数据库、RAGFlow 三类信息获取助手
@@ -114,6 +119,52 @@ async def _get_agent():
             f"模型调用上限 run={MODEL_RUN_LIMIT}/thread={MODEL_THREAD_LIMIT}"
         )
         return _main_agent
+
+
+async def _consume_agent_stream(agent_factory, message: str, config: dict) -> None:
+    """
+    执行主智能体并消费其流式输出（原 run_deep_agent 的内联循环）
+
+    独立成协程是为了让 run_deep_agent 能用 asyncio.wait_for 对整个执行
+    （含 Agent 惰性初始化）施加硬超时——异步生成器无法直接套 wait_for。
+    :param agent_factory: 返回主智能体实例的协程函数（_get_agent）
+    """
+    # 首次调用会完成 Agent 组装和 SQLite checkpointer 初始化
+    # （超时同样覆盖初始化阶段，防数据库异常挂起）
+    agent = await agent_factory()
+
+    # astream 会持续产出模型节点、工具节点和子智能体节点的状态片段
+    async for chunk in agent.astream(
+        {"messages": [{"role": "user", "content": message}]},
+        config=config,
+    ):
+        # chunk 形如 {"model": {"messages": [...]}}，这里主要关心模型最新消息
+        for node_name, state in chunk.items():
+            if not state or "messages" not in state:
+                continue
+            messages = state["messages"]
+            if messages and isinstance(messages, list):
+                last_msg = messages[-1]
+                if node_name == "model":
+                    if last_msg.tool_calls:
+                        # DeepAgents 调用子智能体时，本质上会产生名为 task 的工具调用
+                        for tool_call in last_msg.tool_calls:
+                            if tool_call["name"] == "task":
+                                # 子智能体调用单独上报，前端可以展示“正在调用哪个专家助手”
+                                monitor.report_assistant(
+                                    tool_call["args"]["subagent_type"],
+                                    {
+                                        "description": tool_call["args"][
+                                            "description"
+                                        ]
+                                    },
+                                )
+                    elif last_msg.content:
+                        # 模型没有继续调用工具时，最新文本内容就是本轮可反馈给前端的结果
+                        print(
+                            f"主智能体执行结果，最终结果：{last_msg.content[:100]}"
+                        )
+                        monitor.report_task_result(last_msg.content)
 
 
 async def run_deep_agent(task_query, session_id, user_id="local"):
@@ -190,42 +241,21 @@ async def run_deep_agent(task_query, session_id, user_id="local"):
     """
 
     try:
-        # 首次调用会完成 Agent 组装和 SQLite checkpointer 初始化
-        agent = await _get_agent()
+        # 硬超时兜底（P1-4）：LLM 网络半开或失控循环会让任务永远停在"运行中"。
+        # 超时取消内部执行并经 monitor 告知前端；用户主动取消走 CancelledError 分支
+        await asyncio.wait_for(
+            _consume_agent_stream(
+                _get_agent, task_query + path_instruction, config
+            ),
+            timeout=TASK_TIMEOUT_SECONDS,
+        )
 
-        # astream 会持续产出模型节点、工具节点和子智能体节点的状态片段
-        async for chunk in agent.astream(
-            {"messages": [{"role": "user", "content": task_query + path_instruction}]},
-            config=config,
-        ):
-            # chunk 形如 {"model": {"messages": [...]}}，这里主要关心模型最新消息
-            for node_name, state in chunk.items():
-                if not state or "messages" not in state:
-                    continue
-                messages = state["messages"]
-                if messages and isinstance(messages, list):
-                    last_msg = messages[-1]
-                    if node_name == "model":
-                        if last_msg.tool_calls:
-                            # DeepAgents 调用子智能体时，本质上会产生名为 task 的工具调用
-                            for tool_call in last_msg.tool_calls:
-                                if tool_call["name"] == "task":
-                                    # 子智能体调用单独上报，前端可以展示“正在调用哪个专家助手”
-                                    monitor.report_assistant(
-                                        tool_call["args"]["subagent_type"],
-                                        {
-                                            "description": tool_call["args"][
-                                                "description"
-                                            ]
-                                        },
-                                    )
-                        elif last_msg.content:
-                            # 模型没有继续调用工具时，最新文本内容就是本轮可反馈给前端的结果
-                            print(
-                                f"主智能体执行结果，最终结果：{last_msg.content[:100]}"
-                            )
-                            monitor.report_task_result(last_msg.content)
-
+    except asyncio.TimeoutError:
+        # wait_for 超时会先取消内部协程再抛 TimeoutError，此处告知前端并正常收尾
+        monitor.report_error(
+            f"任务执行超过 {TASK_TIMEOUT_SECONDS:.0f} 秒硬超时，已终止；"
+            "可缩小任务范围后重试"
+        )
     except asyncio.CancelledError:
         monitor.report_task_cancelled()
         raise

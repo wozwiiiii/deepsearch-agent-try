@@ -8,7 +8,8 @@
 > - 第一批（安全加固）：路径穿越、SQL 只读、上传限制、横向越权、CORS 等 7 类问题
 > - 第二批（认证与状态）：API Key 认证 + 多租户隔离 + SQLite 持久化 checkpointer
 > - 第三批（限流与成本）：slowapi 按密钥限流 + fail-closed 开发模式 + 模型调用硬上限
-> - 审查修复：代码审查发现的 4 项问题（上传总量限制、失败回滚、测试隔离、非 ASCII 密钥）
+> - 第四批（P0-3 事件回放 + P1-4 任务硬超时）：SQLite 事件库 + seq 序号 + last_seq 差量补发 + 前端指数退避；`TASK_TIMEOUT_SECONDS` 任务级硬超时
+> - 审查修复：第三批后审查修复 4 项（上传总量限制、失败回滚、测试隔离、非 ASCII 密钥）；第四批后审查修复 3 项（前端补发预算烧穿、差量补发截断、双 commit）+ 清理死代码 1 项
 
 ## 一、已完成的修复
 
@@ -115,7 +116,41 @@
 - **修复**：`ModelCallLimitMiddleware(run_limit=80, thread_limit=300, exit_behavior="error")`——单次任务最多 80 次模型调用、单会话（跨重启累计）最多 300 次，超限抛异常由 `run_deep_agent` 捕获并经 monitor 告知前端。阈值可用 `MODEL_RUN_LIMIT` / `MODEL_THREAD_LIMIT` 环境变量调整。
 - **边界**：这是调用次数上限，不是 token 预算；token 级熔断（按 usage_metadata 累计）仍是待做项。
 
-## 四、代码审查修复（2026-08-17）
+## 四、第四批（2026-08-30）：P0-3 事件回放
+
+### 11. 事件持久化与序号（`app/api/event_store.py` 新增 + `monitor.py` 改造）
+
+- **原问题**：monitor 事件直接 `WS.send_json()`，发完即丢。断线期间的事件（工具调用、子智能体结果、**最终答案**）永久丢失；事件无序号，前端无法发现丢件；服务重启后历史事件无法回放给重连的前端；前端固定 2s 重连无退避（`useDeepAgentSession.ts`），服务抖动时雪崩重连。
+- **修复**（协议与 Redis Stream 对齐，详见 `docs/EVENT_REPLAY_DESIGN.md`）：
+  - `SqliteEventStore`：事件按复合键 `{user_id}-{thread_id}` 落 SQLite（`EVENT_DB` 可配，WAL 模式），`AUTOINCREMENT` 主键即全局自增事件序号 `seq`（等价 Stream ID）；`append` 写入时按 `EVENT_MAX_PER_STREAM`（默认 1000）裁剪旧事件（等价 `XADD MAXLEN`）；
+  - `monitor._emit` 改为先落库拿 seq 再推 WS：payload 携带 `seq`，前端据此检测丢件；持久化失败降级为"该事件不可回放"，不阻塞实时推送；
+  - WS 握手支持 `last_seq` 查询参数：服务端 `read_after` 只补发其后差量（等价 `XREAD`），补发完成后再注册实时推送（先注册会导致补发与实时事件交错、seq 乱序）；首次连接补发最近 `EVENT_REPLAY_LIMIT`（默认 100）条，页面刷新可恢复上一轮执行轨迹；非法 `last_seq` 拒绝握手（1008）；
+  - 补发事件带 `replay: true` 标记：前端只对实时流做 seq 跳号检测，避免事件流被服务端裁剪后陷入"补发→再跳号→再补发"循环；
+  - 前端：记录 `last_seq` 随重连上送；实时流 seq 跳号 → 主动断开重连触发差量补发（限 3 次预算）；重叠窗口重复事件按 seq 去重；固定 2s 重连改指数退避 + 随机抖动（2s→4s→…上限 60s），连接成功计数清零。
+- **为什么是 SQLite 而非设计稿的 Redis Stream**：当前仍是单进程部署，引入 Redis 只为存事件不划算（第一性原理：先修真实缺陷，不提前引入用不上的基础设施）；`append`/`read_after` 与 `XADD`/`XREAD` 语义一一对应，P0-2 任务出进程接入 Redis 时只换存储实现类，monitor 与 WS 端点调用代码不变。
+- **已知边界**：补发读取与实时注册之间存在毫秒级窗口，期间事件由前端 seq 跳号检测兜底（主动补发恢复）；WS 背压下推送顺序与 seq 顺序理论上可倒置（append 与 send 之间有让步点），同样由前端跳号检测→补发闭环自愈——协议把顺序视为不可信、以 seq 为准；多副本部署仍需 P0-2（事件广播），本批只解决单进程内的持久化与回放；设计稿的"任务结束 30 分钟后删除 Stream"未实现（只有 MAXLEN 条数裁剪，events 表随会话数增长，待办）。
+- **验证**：`tests/test_event_replay.py`（14 个用例：seq 递增与 payload 结构、差量读取、task_key 流隔离、裁剪保留最近 N 条、新实例读回等价重启、monitor 落库携带 seq、last_seq 差量补发、首次连接恢复、实时事件带 seq、非法 last_seq 拒绝、跨租户回放隔离、差量全量补发不受 replay_limit 截断、并发 append 序号唯一有序）。
+
+### 12. 任务级硬超时（`main_agent.py`，P1-4 的超时部分）
+
+- **原问题**：LLM API 网络半开挂起时任务永远停在"运行中"——前端一直转圈、占用模型调用预算、普通取消难以打断；`run_deep_agent` 无外层超时。
+- **修复**：流式消费逻辑抽取为 `_consume_agent_stream`，整个执行（含 Agent 惰性初始化）包在 `asyncio.wait_for(..., timeout=TASK_TIMEOUT_SECONDS)` 内，默认 600 秒可配。超时先取消内部协程再抛 `TimeoutError`，由 `run_deep_agent` 捕获并经 monitor 告知前端（错误事件同样落事件库、断线可回放）；用户主动取消仍走 `CancelledError` 分支。
+- **验证**：`tests/test_checkpointer.py::TestTaskTimeout`（2 个用例：astream 挂起被超时终止并上报、初始化挂起同样被覆盖）。
+
+### 13. 第四批代码审查修复（2026-08-30）
+
+对第四批增量做正式代码审查后修复 3 项、清理 1 项：
+
+| # | 问题 | 修复 |
+|---|------|------|
+| R-1 | 前端跳号触发重连后、连接真正关闭前，同一突发的每条实时事件都各自消耗一次补发预算（上限 3），3 条突发即烧穿，之后丢件不再补发 | resync pending 期间丢弃实时事件（重连补发会按序重投） |
+| R-2 | `read_after(last_seq=...)` 误用首次连接的 `replay_limit`（100）做差量上限，断线累积更多事件时一轮补发补不完，多轮补发会烧穿预算 | 显式 last_seq 的差量上限放宽到 `max_per_stream`（裁剪天然边界），语义对齐 XREAD 读尽积压 |
+| R-3 | 每条事件 commit 两次（INSERT 与裁剪 DELETE 各一次），多一次 WAL fsync | 合并为单事务单次提交 |
+| R-4 | `ConnectionManager.connect` 改造后无调用方（死代码） | 删除，WS 端点统一 accept + register |
+
+审查中证伪的怀疑（记录结论不修）：`asyncio.Lock` 跨事件循环绑定——探针实证 3.12 无争用快路径不绑定循环，生产单循环且测试无并发争用，不成立。
+
+## 五、代码审查修复（2026-08-17）
 
 对前三批全部增量做正式代码审查后修复的 4 项：
 
@@ -128,11 +163,11 @@
 
 审查中记录但暂缓的低优先级项（见面试/03 缺陷清单）：`_agent_init_lock` 跨事件循环隐患（加注释/重构）、`rglob` 符号链接防御、`last_msg.content` 类型防御、前端 401 专门提示。
 
-## 五、如何验证
+## 六、如何验证
 
 ```bash
-# 后端全部测试（129 个用例：安全 90 + 认证/租户/限流 35 + 持久化 4）
-# 分布：path_safety 14 / sql_guard 45 / api_security 31 / auth 28 / rate_limit 7 / checkpointer 4
+# 后端全部测试（145 个用例：安全 90 + 认证/租户/限流 35 + 持久化与超时 6 + 事件回放 14）
+# 分布：path_safety 14 / sql_guard 45 / api_security 31 / auth 28 / rate_limit 7 / checkpointer 6 / event_replay 14
 uv sync --group dev
 uv run pytest tests/ -q
 
@@ -140,21 +175,21 @@ uv run pytest tests/ -q
 cd frontend && pnpm install && pnpm exec tsc -b
 ```
 
-## 六、尚未完成的企业级差距（下一步路线图）
+## 七、尚未完成的企业级差距（下一步路线图）
 
 以下按「上线阻塞性」排序，是诚实的能力边界，也是后续迭代计划：
 
-1. **任务队列与并发治理（上线前必须）**：当前 `asyncio.create_task` 进程内执行，重启即丢、无法水平扩容；`active_tasks` 是进程内 dict，多 worker 部署下取消接口失效。引入 Celery / ARQ / Temporal，Agent 执行与 API 进程分离，任务状态入 Redis 或数据库。~~限流与成本控制~~（第三批已完成 slowapi 限流 + 模型调用上限；token 级预算熔断仍待做）。
+1. **任务队列与并发治理（上线前必须，唯一剩余 P0）**：当前 `asyncio.create_task` 进程内执行，重启即丢、无法水平扩容；`active_tasks` 是进程内 dict，多 worker 部署下取消接口失效。引入 Celery / ARQ / Temporal，Agent 执行与 API 进程分离，任务状态入 Redis 或数据库，事件广播换 Redis Stream（本批事件存储已按 append/read_after 可替换语义设计，替换只改实现类）。~~限流与成本控制~~（第三批完成）、~~事件回放单机版~~（第四批完成，多副本广播仍需本项）。
 2. **可观测性**：`print` 全量替换为结构化日志（logging + JSON formatter），接入 OpenTelemetry trace（LangSmith / LangFuse 追踪 Agent 链路），Prometheus 指标（任务时长、工具失败率、LLM token 消耗）+ 告警。
-3. **评测体系**：固定评测集（20–50 个典型任务）+ LLM-as-judge 自动评分 + 检索质量（命中率/引用准确率）指标，接 CI 做回归。这是 Agent 项目区别于 demo 的核心证据。
+3. **评测体系**：~~固定评测集~~（最小版已建：`eval/` 20 用例 + 确定性判分 + LLM-as-judge）；待扩到 50 条并接 CI 做回归。这是 Agent 项目区别于 demo 的核心证据。
 4. **CI/CD**：GitHub Actions（lint + pytest + tsc + build），pre-commit 已有配置需补齐 ruff/mypy 钩子；后端目前无 Dockerfile（只有 MySQL compose），需补多阶段构建镜像。
 5. **内容安全**：上传文件病毒扫描（ClamAV）、模型输出审核（涉政/敏感词）、提示注入防护（系统提示与用户输入隔离、工具结果标记为不可信数据）。
 6. **认证升级路径**：当前 API Key 适合个人/小团队部署；对外多用户产品需换 OIDC（Authing / Casdoor / Auth0）+ JWT，密钥轮换与吊销机制（短时一次性令牌替代查询参数密钥）。
 
-## 七、与上游教学版的关系
+## 八、与上游教学版的关系
 
 本仓库基于开源教学项目 deepsearch-agents（MIT 协议）。简历与面试中的正确定位是：
-"基于开源教学项目做了**生产化改造**：三批改造 + 一次正式代码审查修复，覆盖路径穿越、
-SQL 任意执行、横向越权、无认证、租户串台、无限流等 14 类问题，129 个回归测试"——
+"基于开源教学项目做了**生产化改造**：四批改造 + 两次正式代码审查修复，覆盖路径穿越、
+SQL 任意执行、横向越权、无认证、租户串台、无限流、事件不可回放、任务无超时等 16 类问题，145 个回归测试"——
 而不是把整个项目说成从零自研。
 能逐条讲清楚"原版哪里有洞、我怎么修的、怎么验证的"，比笼统的"独立开发"更可信。

@@ -1,8 +1,8 @@
 # deepsearch-agents 工作状态报告
 
-> **导出时间**：2026-08-17
+> **更新时间**：2026-08-30
 > **分支**：`production-hardening`（基于 `main` 分支）
-> **最新提交**：`d2bc74e` 生产化第二批：API Key 认证 + 多租户隔离 + SQLite 持久化 checkpointer
+> **最新提交**：`9f04b45` 评测集最小版 + P0-2/P0-3 设计方案（第四批事件回放为未提交工作区改动）
 
 ---
 
@@ -12,84 +12,52 @@
 |------|------|------|
 | 第一批：安全加固（路径/SQL/会话隔离） | ✅ 已提交 | `d0f6eed` → `70f3162` |
 | 第二批：认证 + 多租户 + SQLite 持久化 | ✅ 已提交 | `d2bc74e` |
-| 第三批：限流 + fail-closed + 模型调用上限 + 审查修复 | ✅ 已提交 | 15 modified + 4 new（CI / 只读用户脚本 / 限流测试 / 状态报告） |
-| 面试文档（4 份） | ⚠️ 第二批版本（**未更新第三批内容**） | — |
-| CI 流水线 | ✅ 已创建文件，**未提交** | `.github/workflows/ci.yml` |
+| 第三批：限流 + fail-closed + 模型调用上限 + 审查修复 | ✅ 已提交 | `62f13ab` |
+| UNION 等集合操作补 LIMIT + 测试数同步 | ✅ 已提交 | `3ccd40b` |
+| 评测集最小版 + P0-2/P0-3 设计方案 | ✅ 已提交 | `9f04b45` |
+| 第四批：P0-3 事件回放 + 审查修复 + P1-4 任务硬超时 | ✅ 已完成，**未提交** | 见下节 |
+| 面试文档（5 份） | ✅ 已同步至第四批后状态（145 测试） | — |
 
 ---
 
-## 二、第三批改动清单（未提交）
+## 二、第四批改动清单（P0-3 事件回放 + 审查修复 + P1-4 硬超时，未提交）
 
-### 2.1 改动统计
+### 2.1 改动内容
 
-- **修改文件**：15 个（+540 行 / -38 行）
-- **新增文件**：4 个（`tests/test_rate_limit.py`、`.github/workflows/ci.yml`、`docker/mysql/02-create-readonly-user.sh`、`docs/WORK_STATUS.md`）
-- **全量测试**：**129 个用例全部通过**（6.94s）
-
-### 2.2 按功能模块分组
-
-#### A. 接口限流（slowapi）— `app/api/server.py` (+127 行)
-
-| 变更 | 说明 |
-|------|------|
-| `Limiter` + `key_func` | 按密钥 SHA-256 截断 16 位计配额，无密钥回退 IP |
-| `@limiter.limit` 装饰器 | `/api/task` 限 `RATE_LIMIT_TASK`（默认 10/min），`/api/upload` 限 `RATE_LIMIT_UPLOAD`（默认 30/min） |
-| 429 异常处理 | `RateLimitExceeded` → JSON `{"detail":"..."}`, 标准剩余额度响应头 |
-| lifespan 警告 | 启动时打印认证配置状态（已配置密钥 / 开发模式 / 503 报错） |
-
-#### B. Fail-closed 开发模式 — `app/api/auth.py` (+36/-12 行)
-
-| 变更 | 说明 |
-|------|------|
-| `is_dev_mode_enabled()` | 仅 `ALLOW_DEV_MODE=1` 时启用开发模式 |
-| Fail-closed 逻辑 | 未配置 `API_KEYS` + 未开启 dev → 业务接口返回 **503** |
-| 非 ASCII 密钥防御 | 直接返回 401 而非 `compare_digest` TypeError → 500 |
-
-#### C. 模型调用硬上限 — `app/agent/main_agent.py` (+25 行)
-
-| 变更 | 说明 |
-|------|------|
-| `ModelCallLimitMiddleware` | `run_limit=80`（单次任务）/ `thread_limit=300`（单会话累计） |
-| 环境变量可配 | `MODEL_RUN_LIMIT` / `MODEL_THREAD_LIMIT` |
-| `exit_behavior="error"` | 超限抛异常 → `run_deep_agent` 捕获 → monitor 告知前端 |
-
-#### D. SQL 自动 LIMIT — `app/tools/db_tools.py` (+43 行)
-
-| 变更 | 说明 |
-|------|------|
-| `enforce_select_limit()` | sqlglot 解析 SELECT 语句，无 LIMIT 时自动追加 `LIMIT 1000` |
-| 环境变量可配 | `SQL_MAX_LIMIT`（默认 1000） |
-| 解析失败拒绝 | sqlglot ParseError → `SQLSafetyError`，不执行 |
-
-#### E. 代码审查修复
-
-| 编号 | 文件 | 修复 |
+| 文件 | 变更 | 说明 |
 |------|------|------|
-| R-1 | `server.py` | 新增 `MAX_UPLOAD_TOTAL_SIZE` + `MAX_UPLOAD_FILES`，写盘前拒绝超量 |
-| R-2 | `server.py` | `_rollback_saved()`：任一文件失败清理已写入的全部文件 |
-| R-3 | `auth.py` | 非 ASCII 密钥返回 401（审查修复） |
-| R-4 | `monitor.py` | 新增 `report_error()` 公开接口；测试文件运行时目录隔离到 `tmp_path` |
+| `app/api/event_store.py`（新增） | ~200 行 | SQLite 事件库：`append` 返回全局自增 seq（等价 XADD），`read_after` 差量读取（等价 XREAD），按 `EVENT_MAX_PER_STREAM` 裁剪（等价 MAXLEN）；与 Redis Stream 语义一一对应，P0-2 时可整体替换实现 |
+| `app/api/monitor.py` | 重构 `_emit` | 事件先落库拿 seq 再推 WS；持久化失败降级为不可回放，不阻塞实时推送；`ConnectionManager.register` 与 accept 分离（补发完成后才注册实时推送，防乱序） |
+| `app/api/server.py` | WS 端点 | 握手支持 `last_seq`（非法值 1008 拒绝）；先补发差量再注册；首次连接补发最近 `EVENT_REPLAY_LIMIT` 条 |
+| `frontend/src/hooks/useDeepAgentSession.ts` | +退避/补发 | 指数退避 + 抖动（2s→60s 上限）；seq 跳号主动重连补发（限 3 次）；补发事件跳过跳号检测；重叠窗口按 seq 去重 |
+| `frontend/src/types.ts` | 类型 | `MonitorMessage` 增加 `seq` / `replay` 字段 |
+| `tests/test_event_replay.py`（新增） | 14 用例 | 存储层（seq/差量/隔离/裁剪/重启可读/并发有序）、monitor 落库、WS 补发协议、租户回放隔离 |
+| `app/agent/main_agent.py` | P1-4 硬超时 | 流式消费抽为 `_consume_agent_stream`，`asyncio.wait_for(TASK_TIMEOUT_SECONDS=600)` 包住整个执行（含初始化）；超时经 monitor 告知前端 |
+| `tests/test_checkpointer.py` | +2 用例 | 任务超时：astream 挂起被终止并上报、初始化挂起同样覆盖 |
+| `tests/conftest.py` | 环境隔离 | `EVENT_DB` 指向系统临时目录，测试不写真实 `app/data/` |
+| `pyproject.toml` / `.env.example` / `.gitignore` | 配套 | 显式声明 `aiosqlite`；新增事件回放 3 个 + `TASK_TIMEOUT_SECONDS` 环境变量；忽略本地 pnpm store |
 
-#### F. 测试
+**第四批代码审查修复**（对上述增量做正式审查后）：
 
-| 文件 | 用例数 | 覆盖内容 |
-|------|--------|----------|
-| `tests/test_rate_limit.py`（**新建**） | 7 | 限流键构造、任务/上传 429、独立配额、认证先于限流 |
-| `tests/test_auth.py`（新增类） | +5 | fail-closed 503、dev mode 放行/拒绝非"1"值、endpoint/WS |
-| `tests/test_sql_guard.py`（新增类） | +7 | 自动 LIMIT、已有 LIMIT 保留、JOIN 语义、SHOW 放行、解析错误、完整链路 |
-| `tests/test_checkpointer.py`（新增类） | +4 | middleware 透传验证（run_limit/thread_limit 分别断言） |
-| `tests/test_api_security.py`（新增） | +4 | 文件数超限、总量超限+回滚、非法扩展名+回滚 |
-| `tests/conftest.py` | 修改 | `ALLOW_DEV_MODE=1` + 高默认限流上限（1000/min） |
+| # | 问题 | 修复 |
+|---|------|------|
+| R-1 | 前端补发预算被事件风暴烧穿（close 到 onclose 间每条事件各耗一次预算） | resync pending 期间丢弃实时事件 |
+| R-2 | 显式 last_seq 差量补发被 replay_limit=100 截断，大间隙需多轮补发且烧穿预算 | 差量上限放宽到 max_per_stream |
+| R-3 | 每条事件 commit 两次，多一次 WAL fsync | 合并单事务 |
+| R-4 | `ConnectionManager.connect` 死代码 | 删除 |
+| 证伪 | asyncio.Lock 跨循环绑定（探针实证不成立，记录不修） | — |
 
-#### G. 基础设施
+### 2.2 验证结果
 
-| 文件 | 说明 |
-|------|------|
-| `.github/workflows/ci.yml`（**新建**，59 行） | GitHub Actions CI：Python 3.12 + uv pytest / Node 22 + pnpm tsc -b |
-| `docker/mysql/02-create-readonly-user.sh`（**新建**，22 行） | 创建 `deepsearch_ro@%` 只读用户，`GRANT SELECT` |
-| `docker/docker-compose.yaml` | 挂载 initdb 脚本 02 + `MYSQL_READONLY_PASSWORD` |
-| `pyproject.toml` | 新增 `slowapi>=0.1.10`、`sqlglot>=30.17.0` |
-| `.env.example` | 新增 8 个环境变量（限流/成本/dev mode/upload 总量） |
+- 后端：**145 个用例全部通过**（原 129 + 事件回放 14 + 任务超时 2，`.venv/Scripts/python.exe -m pytest tests/ -q`，约 9 秒）
+- 前端：`tsc -b` 零错误（注：`frontend/node_modules` 因项目目录迁移 junction 失效，已用 `pnpm install --store-dir ./.pnpm-store-local` 重装修复）
+
+### 2.3 已知边界（如实标注）
+
+- 补发读取与实时注册间存在毫秒级窗口，由前端 seq 跳号检测兜底；
+- WS 背压下推送顺序与 seq 顺序理论上可倒置，前端跳号检测→补发闭环自愈（协议以 seq 为准）；
+- 多副本事件广播仍需 P0-2（本批只解决单进程持久化与回放）；
+- 事件库无 TTL 清理，只有条数裁剪（每 task_key 保留最近 1000 条）。
 
 ---
 
@@ -102,48 +70,34 @@
 | `tests/test_api_security.py` | 31 | 上传安全 + 会话隔离 + 回滚 |
 | `tests/test_auth.py` | 28 | API Key 认证 + fail-closed + 非 ASCII |
 | `tests/test_rate_limit.py` | 7 | slowapi 限流 |
-| `tests/test_checkpointer.py` | 4 | SQLite 持久化 + middleware 透传 |
-| **合计** | **129** | — |
-
-> 注：实测分布（`pytest --co` 统计）：path 14 / sql 45 / api 31 / auth 28 / rate_limit 7 / checkpointer 4，合计 129。早期版本误记 sql_guard 为 34（连带总数误记 118）；第三批后 sql_guard 增至 45（含 UNION 等集合操作补 LIMIT 用例），以实测为准。
-
----
-
-## 四、面试文档状态
-
-4 份文档保存于 `D:\AI_Program\hello-agents-my-build\面试\`，已全部同步至第三批后状态（129 测试）：
-
-| 文档 | 版本 | 状态 |
-|------|------|----------|
-| `01-项目结构与核心逻辑解析.md` | 第二版（数字已同步） | 测试数 129、提交清单含三批；正文聚焦前两批结构/安全，第三批见 PRODUCTION_NOTES |
-| `02-安全防护机制详解.md` | 第二版（数字已同步） | 测试数 129、分项含 UNION 补 LIMIT；正文聚焦前两批漏洞 |
-| `03-现存缺陷与改进路线.md` | 第三版 | 含第三批内容；P1-6 SQL 自动 LIMIT（含 UNION 残留）已标完成；测试数 129 |
-| `04-面试官问题清单与参考回答.md` | 第三版 | 含限流/fail-closed/调用上限问答；测试数 129 |
+| `tests/test_checkpointer.py` | 6 | SQLite 持久化 + middleware 透传 + 任务硬超时 |
+| `tests/test_event_replay.py` | 14 | 事件回放（存储/落库/补发协议/租户隔离/并发有序） |
+| **合计** | **145** | — |
 
 ---
 
-## 五、尚未完成的待办项
+## 四、尚未完成的待办项
 
 | 优先级 | 任务 | 状态 |
 |--------|------|------|
-| ✅ **P0** | Git 提交第三批改动（15 modified + 4 new） | 已完成（62f13ab） |
-| ✅ **P0** | 更新 `docs/PRODUCTION_NOTES.md` 测试计数（118→125→129、sql_guard 34→41→45）及审查修复节 | 已完成 |
-| ✅ **P1** | 更新 `面试/` 4 份文档（数字同步至 129、03 的 P1-6 标完成） | 已完成 |
-| ✅ **P1** | 修复审查发现：UNION 等集合操作漏过 SQL 自动 LIMIT（enforce_select_limit 扩展 SetOperation + 4 用例） | 已完成（本 commit） |
-| **P2** | 上线路线图中的企业级差距（任务队列、可观测性、评测体系） | 长期 |
+| **P0** | Git 提交第四批改动（事件回放 + 审查修复 + 硬超时） | 待提交 |
+| **P0** | P0-2 任务出进程（ARQ + Redis + Postgres，设计方案已写好） | 未实现 |
+| **P1** | 短时一次性令牌替代查询参数密钥（P1-2） | 未实现 |
+| **P1** | 工具网络重试（tenacity）+ token 级预算熔断（P1-4 残余；硬超时已完成） | 未实现 |
+| **P2** | 评测集扩到 50 条接 CI；可观测性（结构化日志/OTel）；事件库 TTL 清理 | 长期 |
 
 ---
 
-## 六、企业级差距路线图（长期）
+## 五、企业级差距路线图（长期）
 
 | # | 差距 | 阻塞性 | 备注 |
 |---|------|--------|------|
-| 1 | 任务队列与并发治理 | 🔴 上线必须 | `asyncio.create_task` → Celery/ARQ/Temporal |
+| 1 | 任务队列与并发治理（P0-2） | 🔴 上线必须 | `asyncio.create_task` → ARQ；事件存储随本批换 Redis Stream |
 | 2 | 可观测性（结构化日志 + OTel + Prometheus） | 🟡 重要 | 替换 `print`，接入 LangSmith/LangFuse |
-| 3 | 评测体系（固定评测集 + LLM-as-judge + CI 回归） | 🟡 重要 | Agent 项目区别于 demo 的核心证据 |
-| 4 | Token 级预算熔断 | 🟢 改进 | 当前只有调用次数上限，无 token 累计 |
+| 3 | 评测体系扩量 + CI 回归 | 🟡 重要 | 最小版已建（`eval/` 20 用例） |
+| 4 | Token 级预算熔断 | 🟢 改进 | 当前只有调用次数上限 |
 | 5 | 水平扩容 checkpoint（SQLite → Postgres） | 🟢 改进 | 多副本部署时换 `langgraph-checkpoint-postgres` |
 
 ---
 
-*本报告由 ZCode 自动生成，基于 `production-hardening` 分支工作区状态。*
+*本报告基于 `production-hardening` 分支工作区状态维护；历史第三批明细见 git 历史（62f13ab）。*

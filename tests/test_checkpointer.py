@@ -107,3 +107,72 @@ class TestModelCallLimitMiddleware:
         # 上限值透传正确，超限行为为抛错（而不是静默截断）
         assert middlewares[0].run_limit == 5
         assert middlewares[0].thread_limit == 9
+
+
+class _RecordingMonitor:
+    """替身 monitor：记录 error 事件，其余上报静默（避免触碰真实 WS/事件库）"""
+
+    def __init__(self) -> None:
+        self.errors: list[str] = []
+
+    def report_session_dir(self, path: str) -> None:  # noqa: ARG002
+        pass
+
+    def report_error(self, message: str) -> None:
+        self.errors.append(message)
+
+    def report_task_cancelled(self) -> None:
+        pass
+
+    def report_task_result(self, result: str) -> None:  # noqa: ARG002
+        pass
+
+    def report_assistant(self, name: str, args=None) -> None:  # noqa: ARG002
+        pass
+
+
+class TestTaskTimeout:
+    """P1-4 任务硬超时：执行流被超时取消并经 monitor 告知前端，而非永远运行中"""
+
+    def test_timeout_cancels_execution_and_reports_error(self, tmp_path, monkeypatch):
+        class _HangingAgent:
+            """astream 永久挂起，模拟 LLM API 网络半开"""
+
+            async def astream(self, *args, **kwargs):
+                await asyncio.sleep(30)
+                yield {}  # pragma: no cover - 不会执行到
+
+        async def _fake_get_agent():
+            return _HangingAgent()
+
+        stub_monitor = _RecordingMonitor()
+        monkeypatch.setattr(main_agent_module, "project_root_path", tmp_path)
+        monkeypatch.setattr(main_agent_module, "TASK_TIMEOUT_SECONDS", 0.05)
+        monkeypatch.setattr(main_agent_module, "_get_agent", _fake_get_agent)
+        monkeypatch.setattr(main_agent_module, "monitor", stub_monitor)
+
+        # 超时后 run_deep_agent 正常返回（不抛出），错误经 monitor 上报
+        asyncio.run(main_agent_module.run_deep_agent("查询任务", "t-timeout-1", "local"))
+
+        assert any("硬超时" in message for message in stub_monitor.errors), (
+            f"应上报超时错误，实际收到: {stub_monitor.errors}"
+        )
+        # 超时也应有会话工作目录（目录创建发生在执行之前）
+        assert (tmp_path / "output" / "user_local" / "session_t-timeout-1").exists()
+
+    def test_timeout_covers_agent_initialization(self, tmp_path, monkeypatch):
+        """Agent 惰性初始化挂起同样被超时覆盖（wait_for 包住整个执行）"""
+
+        async def _hanging_get_agent():
+            await asyncio.sleep(30)
+            return object()  # pragma: no cover - 不会执行到
+
+        stub_monitor = _RecordingMonitor()
+        monkeypatch.setattr(main_agent_module, "project_root_path", tmp_path)
+        monkeypatch.setattr(main_agent_module, "TASK_TIMEOUT_SECONDS", 0.05)
+        monkeypatch.setattr(main_agent_module, "_get_agent", _hanging_get_agent)
+        monkeypatch.setattr(main_agent_module, "monitor", stub_monitor)
+
+        asyncio.run(main_agent_module.run_deep_agent("查询任务", "t-timeout-2", "local"))
+
+        assert any("硬超时" in message for message in stub_monitor.errors)

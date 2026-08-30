@@ -1,6 +1,11 @@
 # P0-3 WebSocket 事件回放设计方案
 
-> 状态：**设计稿**（未实现）。与 P0-2 任务队列天然合并（都用 Redis，事件落 Stream 既能广播又能回放）。
+> 状态：**已实现（SQLite 版，2026-08-30 第四批）**。本方案中的 seq 序号、last_seq 差量补发、
+> 前端指数退避、限长裁剪均已落地，实现记录见 `PRODUCTION_NOTES.md` 第四批与
+> `tests/test_event_replay.py`。
+> **与设计稿的唯一偏差**：存储后端用 SQLite（`app/api/event_store.py`）而非 Redis Stream——
+> 当前单进程部署引入 Redis 只为存事件不划算。`append`/`read_after` 与 `XADD`/`XREAD`
+> 语义一一对应，P0-2 任务出进程接入 Redis 时只换存储实现类，协议与前端零改动。
 > 目标：断线/重连不丢事件、能发现丢件、服务重启后历史可回放。
 
 ## 一、当前为什么丢事件

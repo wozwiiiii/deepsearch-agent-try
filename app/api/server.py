@@ -53,6 +53,7 @@ from app.api.auth import (
     is_dev_mode_enabled,
     require_principal,
 )
+from app.api.event_store import event_store
 from app.api.monitor import manager
 
 # ---------------------------------------------------------------------------
@@ -514,6 +515,11 @@ async def websocket_endpoint(websocket: WebSocket, thread_id: str):
     该形式的密钥可能出现在访问日志中，属已知取舍（详见 PRODUCTION_NOTES）。
     连接建立后按「租户+thread_id」复合键注册，monitor 事件按同一复合键定向
     推送，保证不同租户即使使用相同 thread_id 也不会收到彼此的执行事件。
+
+    P0-3 事件回放：握手可携带 last_seq 查询参数（前端已收到的最大事件序号），
+    服务端先从事件库补发 last_seq 之后的差量，再注册实时推送。断线期间的
+    事件（含最终答案）不再丢失；不带 last_seq 的首次连接补发最近
+    EVENT_REPLAY_LIMIT 条，页面刷新也能恢复上一轮执行轨迹。
     """
     # 浏览器无法为 WS 设置 X-API-Key 头，鉴权走查询参数
     try:
@@ -524,10 +530,33 @@ async def websocket_endpoint(websocket: WebSocket, thread_id: str):
         return
 
     validate_thread_id(thread_id)
+
+    # last_seq 必须是非负整数：非法值直接拒绝握手，避免歧义补发
+    last_seq_raw = websocket.query_params.get("last_seq")
+    last_seq = None
+    if last_seq_raw is not None:
+        if not re.fullmatch(r"[0-9]{1,18}", last_seq_raw):
+            await websocket.close(code=1008)
+            return
+        last_seq = int(last_seq_raw)
+
     routing_key = composite_task_key(principal.user_id, thread_id)
 
-    # 连接建立后立即按复合键注册，monitor 后续才能把事件定向推给当前页面
-    await manager.connect(websocket, routing_key)
+    await websocket.accept()
+
+    # 先补发历史差量、再注册实时推送：注册提前会导致补发期间的新事件
+    # 与历史事件交错下发，前端按 seq 检测丢件时会误判为乱序
+    try:
+        replayed = await event_store.read_after(routing_key, last_seq)
+    except Exception as e:
+        # 事件库故障不阻断连接：降级为无回放的纯实时模式
+        print(f"[WebSocket] 事件回放读取失败（降级为纯实时模式）: {e}")
+        replayed = []
+    for event_payload in replayed:
+        await websocket.send_json(event_payload)
+
+    # 补发完成后再按复合键注册，monitor 后续才能把事件定向推给当前页面
+    manager.register(websocket, routing_key)
 
     try:
         while True:

@@ -15,6 +15,10 @@ export interface MonitorMessage {
   message: string;
   data: Record<string, unknown>;
   timestamp: string;
+  /** 事件全局序号：连续递增，用于检测丢件和断线差量补发 */
+  seq?: number;
+  /** 服务端回放补发的事件（重连差量/首次连接恢复），不参与跳号检测 */
+  replay?: boolean;
 }
 
 export interface PongMessage {

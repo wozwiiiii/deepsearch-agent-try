@@ -11,6 +11,12 @@ import type {
 } from "../types";
 
 const MAX_EVENTS = 120;
+// 重连退避：2s 起步指数增长，上限 60s，加随机抖动避免服务恢复时雪崩重连
+const RECONNECT_BASE_DELAY_MS = 2000;
+const RECONNECT_MAX_DELAY_MS = 60000;
+// 丢件主动补发（seq 跳号时断开重连触发差量补发）的最大连续尝试次数，
+// 防止事件流被服务端裁剪后陷入"补发→再跳号→再补发"循环
+const MAX_RESYNC_ATTEMPTS = 3;
 
 function extractString(data: Record<string, unknown>, key: string): string | null {
   const value = data[key];
@@ -22,6 +28,13 @@ export function useDeepAgentSession() {
   const reconnectTimerRef = useRef<number | undefined>(undefined);
   const heartbeatTimerRef = useRef<number | undefined>(undefined);
   const uploadedNameSetRef = useRef<Set<string>>(new Set());
+  // 已收到的最大事件序号：重连时经 last_seq 交给服务端做差量补发
+  const lastSeqRef = useRef<number | undefined>(undefined);
+  // 常规断线重连的退避计数（连接成功后清零）
+  const retryCountRef = useRef(0);
+  // 丢件触发的主动补发标记：此类重连立即执行，不走退避
+  const resyncPendingRef = useRef(false);
+  const resyncAttemptsRef = useRef(0);
   const [threadId, setThreadId] = useState(getStoredThreadId);
   const [connectionState, setConnectionState] = useState<ConnectionState>("connecting");
   const [events, setEvents] = useState<MonitorMessage[]>([]);
@@ -77,16 +90,26 @@ export function useDeepAgentSession() {
   useEffect(() => {
     let disposed = false;
 
+    // 新 thread 即新事件流，旧 seq 在新流中无意义
+    lastSeqRef.current = undefined;
+
     function connect() {
       clearSocketTimers();
       const hadSocket = Boolean(socketRef.current);
       socketRef.current?.close();
       setConnectionState(hadSocket ? "reconnecting" : "connecting");
 
-      // 浏览器 WS 无法自定义请求头，鉴权密钥经查询参数传递
-      const wsUrl = API_KEY
-        ? `${WS_BASE_URL}/ws/${encodeURIComponent(threadId)}?api_key=${encodeURIComponent(API_KEY)}`
-        : `${WS_BASE_URL}/ws/${encodeURIComponent(threadId)}`;
+      // 浏览器 WS 无法自定义请求头，鉴权密钥经查询参数传递；
+      // 已收过事件时附带 last_seq，服务端据此做断线差量补发
+      const params = new URLSearchParams();
+      if (API_KEY) {
+        params.set("api_key", API_KEY);
+      }
+      if (lastSeqRef.current !== undefined) {
+        params.set("last_seq", String(lastSeqRef.current));
+      }
+      const query = params.toString();
+      const wsUrl = `${WS_BASE_URL}/ws/${encodeURIComponent(threadId)}${query ? `?${query}` : ""}`;
       const socket = new WebSocket(wsUrl);
       socketRef.current = socket;
 
@@ -94,6 +117,8 @@ export function useDeepAgentSession() {
         if (disposed) {
           return;
         }
+        retryCountRef.current = 0;
+        resyncPendingRef.current = false;
         setConnectionState("connected");
         setLastError("");
         heartbeatTimerRef.current = window.setInterval(() => {
@@ -116,6 +141,40 @@ export function useDeepAgentSession() {
 
           if (payload.type !== "monitor_event") {
             return;
+          }
+
+          // seq 处理：回放事件直接接受（补发批次自身可能因服务端裁剪跳号）；
+          // 实时流 seq 跳号说明有丢件，断开重连触发差量补发
+          if (typeof payload.seq === "number") {
+            // 已决定重连补发：close() 到 onclose 生效之间到达的实时事件一律
+            // 丢弃（重连后会按序补发）。若不丢弃，同一突发里每条事件都会
+            // 各自消耗一次补发预算，3 条突发即烧穿上限（审查修复 R-1）
+            if (resyncPendingRef.current && !payload.replay) {
+              return;
+            }
+
+            const lastSeq = lastSeqRef.current;
+            if (payload.replay) {
+              lastSeqRef.current = Math.max(lastSeq ?? 0, payload.seq);
+            } else if (lastSeq !== undefined) {
+              if (payload.seq <= lastSeq) {
+                // 补发与实时窗口重叠的重复事件，丢弃
+                return;
+              }
+              if (payload.seq > lastSeq + 1 && resyncAttemptsRef.current < MAX_RESYNC_ATTEMPTS) {
+                resyncAttemptsRef.current += 1;
+                resyncPendingRef.current = true;
+                socket.close();
+                return;
+              }
+              lastSeqRef.current = payload.seq;
+            } else {
+              lastSeqRef.current = payload.seq;
+            }
+            // 收到连续实时事件说明流已恢复，重置主动补发预算
+            if (!payload.replay) {
+              resyncAttemptsRef.current = 0;
+            }
           }
 
           setEvents((previous) => [...previous, payload].slice(-MAX_EVENTS));
@@ -166,7 +225,18 @@ export function useDeepAgentSession() {
           return;
         }
         setConnectionState("reconnecting");
-        reconnectTimerRef.current = window.setTimeout(connect, 2000);
+        if (resyncPendingRef.current) {
+          // 丢件触发的主动补发：立即带 last_seq 重连做差量补发
+          reconnectTimerRef.current = window.setTimeout(connect, 0);
+        } else {
+          // 常规断线：指数退避 + 随机抖动，防止服务恢复瞬间雪崩重连
+          const delay = Math.min(
+            RECONNECT_BASE_DELAY_MS * 2 ** retryCountRef.current,
+            RECONNECT_MAX_DELAY_MS
+          ) + Math.random() * 1000;
+          retryCountRef.current += 1;
+          reconnectTimerRef.current = window.setTimeout(connect, delay);
+        }
       };
     }
 
@@ -209,6 +279,9 @@ export function useDeepAgentSession() {
       setEvents([]);
       setResult("");
       setLastError("");
+      // 新任务的执行轨迹从零开始收集：重置 seq 基线，
+      // 避免服务端重启（seq 重新从小值自增）后新事件被当作重复丢弃
+      lastSeqRef.current = undefined;
       try {
         const response = await startTask(cleanQuery, threadId);
         if (response.thread_id && response.thread_id !== threadId) {
