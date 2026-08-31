@@ -11,6 +11,7 @@
 """
 
 import os
+import re
 from pathlib import Path
 from typing import Optional
 
@@ -28,6 +29,32 @@ class PathEscapeError(ValueError):
 
 # 大模型常返回 /workspace、/mnt/data 这类虚拟沙箱前缀，解析前统一剥离
 ALLOWED_VIRTUAL_PREFIXES = ("/workspace", "/mnt/data", "/home/user")
+
+
+def _is_forbidden_absolute_path(value: str) -> bool:
+    r"""
+    显式识别绝对路径，避免在 POSIX 环境下误判 Windows 盘符路径。
+
+    需要拦截的情况包括：
+    - Unix 根路径：/etc/passwd
+    - UNC 路径：//server/share
+    - Windows 盘符绝对路径：C:/Users/... 或 C:\Users\...
+    """
+    if not value:
+        return False
+
+    normalized = value.replace("\\", "/")
+
+    if normalized.startswith("/"):
+        return True
+
+    if normalized.startswith("//"):
+        return True
+
+    if re.match(r"^[A-Za-z]:[/\\]", normalized):
+        return True
+
+    return False
 
 
 def resolve_path(filename: str, session_dir: Optional[str] = None) -> str:
@@ -61,13 +88,13 @@ def resolve_path(filename: str, session_dir: Optional[str] = None) -> str:
 
     if session_dir is None:
         # 无会话上下文的本地脚本调试场景：只允许相对路径
-        if os.name == "nt" and Path(path_str).is_absolute():
+        if _is_forbidden_absolute_path(path_str):
             raise PathEscapeError(raw, "无会话上下文时禁止使用绝对路径")
         return str(Path(path_str).resolve())
 
     session_path = Path(session_dir).resolve()
 
-    if Path(path_str).is_absolute():
+    if _is_forbidden_absolute_path(path_str):
         # 绝对路径一律拒绝：即使指向会话目录内部也要求改用相对形式，
         # 避免 Windows/Unix 路径差异导致的校验绕过
         raise PathEscapeError(raw, "禁止使用绝对路径")
