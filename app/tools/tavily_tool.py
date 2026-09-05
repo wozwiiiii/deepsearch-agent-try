@@ -20,6 +20,14 @@ load_dotenv()
 # TavilyClient 是实际访问搜索服务的客户端；模块级复用可避免每次工具调用重复初始化
 tavily_client = TavilyClient(api_key=os.getenv("TAVILY_API_KEY"))
 
+# 上下文预算控制（首轮基线 web-03 实测：搜索正文累积把输入推到 39820 tokens，
+# 超过 Qwen2.5-32B 的 32768 上限直接报 400）。主智能体固定开销约 8K tokens
+# （系统提示词+工具 schema），网络搜索子智能体单任务最多 5 次检索，若每条
+# 结果不设上限，累计正文可再吃掉 2-3 万 tokens，必然撑爆上下文。
+# 这里做确定性截断，把 5 次检索的正文总量压进预算（5×5×800 字符 ≈ 1.5 万字符）。
+_MAX_CONTENT_CHARS = 800
+_MAX_RAW_CONTENT_CHARS = 2000
+
 
 # @tool 会把函数签名和 docstring 暴露给 DeepAgents，模型据此决定是否调用以及如何填参
 @tool
@@ -52,15 +60,26 @@ def internet_search(
     )
 
     # Tavily 返回 query、results、title、url、content 等结构化字段，后续由子智能体阅读并汇总
-    # timeout=20：网络半开时 HTTP 可能无限期挂起，LangChain 线程池中的工作线程会被永久占用；
-    # 给单次搜索固定 20s 上限，超时即抛错让线程及时归还线程池
-    return tavily_client.search(
+    # timeout=45：网络半开时 HTTP 可能无限期挂起，LangChain 线程池中的工作线程会被永久占用；
+    # 需要固定上限让线程及时归还线程池。首轮基线 web-09 实测 20s 不够覆盖慢查询
+    # （双联抗用药建议检索超时），上调到 45s，仍是有限等待、线程池保护语义不变
+    response = tavily_client.search(
         query=query,
         topic=topic,
         max_results=max_results,
         include_raw_content=include_raw_content,
-        timeout=20,
+        timeout=45,
     )
+
+    # 确定性截断：只砍超长正文，保留 title/url/score 等结构字段不变形
+    for item in response.get("results", []):
+        content = item.get("content")
+        if content and len(content) > _MAX_CONTENT_CHARS:
+            item["content"] = content[:_MAX_CONTENT_CHARS] + "…（超长截断）"
+        raw = item.get("raw_content")
+        if raw and len(raw) > _MAX_RAW_CONTENT_CHARS:
+            item["raw_content"] = raw[:_MAX_RAW_CONTENT_CHARS] + "…（超长截断）"
+    return response
 
 
 if __name__ == "__main__":
