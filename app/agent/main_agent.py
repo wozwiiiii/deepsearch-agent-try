@@ -24,6 +24,11 @@ from deepagents import create_deep_agent
 from langchain.agents.middleware import ModelCallLimitMiddleware
 from langgraph.checkpoint.sqlite.aio import AsyncSqliteSaver
 
+from app.agent.final_answer_guard import (
+    FINAL_ANSWER_GUARD_MAX,
+    FINAL_ANSWER_GUARD_PROMPT,
+    is_pure_transition_reply,
+)
 from app.agent.llm import model
 from app.agent.prompts import main_agent_content
 from app.agent.subagents.database_query_agent import database_query_agent
@@ -175,6 +180,22 @@ async def _consume_agent_stream(agent_factory, message: str, config: dict) -> No
     独立成协程是为了让 run_deep_agent 能用 asyncio.wait_for 对整个执行
     （含 Agent 惰性初始化）施加硬超时——异步生成器无法直接套 wait_for。
     :param agent_factory: 返回主智能体实例的协程函数（_get_agent）
+
+    最终回答守卫（P1 早停修复）：ReAct 循环里模型输出"无工具调用的纯文本"
+    即宣告回合结束。评测 90 次运行中出现 5 次模型以"我将启动××进行查询。"
+    这类纯过渡语收尾的早停，用户只收到一句空话。守卫在每轮回合自然结束后
+    检查最终回答：命中"短 + 无数字 + 过渡语"的高精度特征时，向同一会话
+    注入纠偏消息强制续跑；守卫最多触发 FINAL_ANSWER_GUARD_MAX 次，续跑后
+    仍是过渡语则放行结束（防死循环）。判据实现在
+    app/agent/final_answer_guard.py。
+
+    调用上限边界（如实说明）：守卫续跑是第二次独立 astream，而
+    ModelCallLimitMiddleware 的 run 级上限（MODEL_RUN_LIMIT=80）以
+    UntrackedValue 计数、不跨运行持久化，续跑轮 run 级计数从 0 重新开始
+    ——单任务模型调用的实际上限最多放宽到约 2×run_limit；thread 级上限
+    （MODEL_THREAD_LIMIT=300，随 checkpoint 持久化）、600s 任务硬超时与
+    token 熔断（tokens_used 为局部变量，跨守卫轮累计）仍然有效，作为
+    成本兜底。
     """
     # 首次调用会完成 Agent 组装和 SQLite checkpointer 初始化
     # （超时同样覆盖初始化阶段，防数据库异常挂起）
@@ -184,52 +205,80 @@ async def _consume_agent_stream(agent_factory, message: str, config: dict) -> No
     # 部分供应商不回传 usage，此时该机制静默失效（边界见 PRODUCTION_NOTES）
     tokens_used = 0
 
-    # astream 会持续产出模型节点、工具节点和子智能体节点的状态片段
-    async for chunk in agent.astream(
-        {"messages": [{"role": "user", "content": message}]},
-        config=config,
-    ):
-        # chunk 形如 {"model": {"messages": [...]}}，这里主要关心模型最新消息
-        for node_name, state in chunk.items():
-            if not state or "messages" not in state:
-                continue
-            messages = state["messages"]
-            if messages and isinstance(messages, list):
-                # 熔断检查放在处理消息之前：预算已超时立即停止，不再多消费一轮
-                if tokens_used > MODEL_TOKEN_RUN_LIMIT:
-                    raise RuntimeError(
-                        f"单次任务 token 消耗 {tokens_used} 已超过预算上限 "
-                        f"{MODEL_TOKEN_RUN_LIMIT}，任务终止"
-                    )
-                for msg in messages:
-                    usage = getattr(msg, "usage_metadata", None)
-                    if usage:
-                        # total_tokens 缺失时按 input+output 兜底
-                        tokens_used += usage.get("total_tokens") or (
-                            usage.get("input_tokens", 0)
-                            + usage.get("output_tokens", 0)
+    # 守卫剩余触发次数：最多 1 次，用尽后过渡语也放行结束（防死循环）
+    guard_remaining = FINAL_ANSWER_GUARD_MAX
+    # 首轮输入原始任务问题；守卫续跑时替换为纠偏消息（同 thread_id 续会话）
+    agent_input: dict = {"messages": [{"role": "user", "content": message}]}
+
+    while True:
+        # 本轮"无工具调用的模型文本"= 回合结束时的最终回答候选；
+        # 模型消息带 tool_calls 说明回合还会继续（工具/子智能体执行后回到模型）
+        final_reply: str | None = None
+
+        # astream 会持续产出模型节点、工具节点和子智能体节点的状态片段
+        async for chunk in agent.astream(agent_input, config=config):
+            # chunk 形如 {"model": {"messages": [...]}}，这里主要关心模型最新消息
+            for node_name, state in chunk.items():
+                if not state or "messages" not in state:
+                    continue
+                messages = state["messages"]
+                if messages and isinstance(messages, list):
+                    # 熔断检查放在处理消息之前：预算已超时立即停止，不再多消费一轮
+                    if tokens_used > MODEL_TOKEN_RUN_LIMIT:
+                        raise RuntimeError(
+                            f"单次任务 token 消耗 {tokens_used} 已超过预算上限 "
+                            f"{MODEL_TOKEN_RUN_LIMIT}，任务终止"
                         )
-                last_msg = messages[-1]
-                if node_name == "model":
-                    if last_msg.tool_calls:
-                        # DeepAgents 调用子智能体时，本质上会产生名为 task 的工具调用
-                        for tool_call in last_msg.tool_calls:
-                            if tool_call["name"] == "task":
-                                # 子智能体调用单独上报，前端可以展示“正在调用哪个专家助手”
-                                monitor.report_assistant(
-                                    tool_call["args"]["subagent_type"],
-                                    {
-                                        "description": tool_call["args"][
-                                            "description"
-                                        ]
-                                    },
-                                )
-                    elif last_msg.content:
-                        # 模型没有继续调用工具时，最新文本内容就是本轮可反馈给前端的结果
-                        logger.info(
-                            f"主智能体执行结果，最终结果：{last_msg.content[:100]}"
-                        )
-                        monitor.report_task_result(last_msg.content)
+                    for msg in messages:
+                        usage = getattr(msg, "usage_metadata", None)
+                        if usage:
+                            # total_tokens 缺失时按 input+output 兜底
+                            tokens_used += usage.get("total_tokens") or (
+                                usage.get("input_tokens", 0)
+                                + usage.get("output_tokens", 0)
+                            )
+                    last_msg = messages[-1]
+                    if node_name == "model":
+                        if last_msg.tool_calls:
+                            # DeepAgents 调用子智能体时，本质上会产生名为 task 的工具调用
+                            for tool_call in last_msg.tool_calls:
+                                if tool_call["name"] == "task":
+                                    # 子智能体调用单独上报，前端可以展示“正在调用哪个专家助手”
+                                    monitor.report_assistant(
+                                        tool_call["args"]["subagent_type"],
+                                        {
+                                            "description": tool_call["args"][
+                                                "description"
+                                            ]
+                                        },
+                                    )
+                            # 本轮仍在推进，不是收尾文本
+                            final_reply = None
+                        elif last_msg.content:
+                            # 模型没有继续调用工具时，最新文本内容就是本轮可反馈给前端的结果
+                            logger.info(
+                                f"主智能体执行结果，最终结果：{last_msg.content[:100]}"
+                            )
+                            monitor.report_task_result(last_msg.content)
+                            # 记录为最终回答候选，供回合结束后的守卫检查
+                            final_reply = last_msg.content
+
+        # 回合自然结束后执行最终回答守卫（判据与续跑提示词见 final_answer_guard）
+        if (
+            guard_remaining > 0
+            and final_reply is not None
+            and is_pure_transition_reply(final_reply)
+        ):
+            guard_remaining -= 1
+            logger.warning(
+                "[MainAgent] 检测到纯过渡语早停"
+                f"（{str(final_reply)[:80]}），触发最终回答守卫强制续跑"
+            )
+            agent_input = {
+                "messages": [{"role": "user", "content": FINAL_ANSWER_GUARD_PROMPT}]
+            }
+            continue
+        break
 
     # 返回本次任务的实际 token 消耗（评测成本核算用；熔断之外的可观测性输出）
     return tokens_used

@@ -205,6 +205,7 @@ cd frontend && pnpm install && pnpm exec tsc -b
 4. **CI/CD**：~~GitHub Actions~~ **已部分完成**（`.github/workflows/ci.yml`：pytest + `eval/cases.py` 结构自检 + 前端 `tsc -b`）。**仍待做**：pre-commit 补齐 ruff/mypy 钩子；后端**无 Dockerfile**（只有 MySQL compose），需补多阶段构建镜像。**另注**：`ci.yml:14` 的 PR 触发分支列表仍含已不存在的 `production-hardening`，属失效配置。
 5. **内容安全**：上传文件病毒扫描（ClamAV）、模型输出审核（涉政/敏感词）、提示注入防护（系统提示与用户输入隔离、工具结果标记为不可信数据）。
 6. **认证升级路径**：当前 API Key 适合个人/小团队部署；对外多用户产品需换 OIDC（Authing / Casdoor / Auth0）+ JWT。~~短时令牌替代查询参数密钥~~（P1-2 已完成：WS 用 60 秒令牌、下载走请求头，`api_key` 查询参数仅剩兼容期旧入口待移除）；密钥轮换与吊销机制仍待做。
+7. **最终回答守卫的漏判边界（设计取舍，非缺陷）**：带阿拉伯/全角数字的过渡语（如"稍等 5 秒"）按设计放行、不触发守卫，符合"宁漏判不误伤"取向——误伤会打断正常简短回答的收尾，漏判至多多一次模型调用且续跑回答会覆盖上报（判据见 `app/agent/final_answer_guard.py`）。
 
 ## 八、与上游教学版的关系
 

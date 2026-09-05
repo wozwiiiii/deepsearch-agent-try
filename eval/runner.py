@@ -81,24 +81,45 @@ def _capture_for_case() -> dict:
 
 
 # ---------------------------------------------------------------------------
+# 限流退避（TPM 429）
+# ---------------------------------------------------------------------------
+
+def rate_limit_backoff_seconds(base_wait: float, attempt: int) -> float:
+    """第 attempt 次重试（0 起）前的指数退避等待秒数：base_wait * 2^attempt
+
+    固定短等待（70s×3）在 TPM 窗口未排空时会把重试额度烧光（v2 轮实测
+    2 条用例重试耗尽报废）；按 2 的幂拉长总等待窗口：60 → 120 → 240。
+    """
+    return base_wait * (2 ** attempt)
+
+
+def has_rate_limit_error(errors: list) -> bool:
+    """捕获的错误列表里是否出现 429（TPM 超限）"""
+    return any("429" in str(e) for e in errors)
+
+
+# ---------------------------------------------------------------------------
 # 单个用例执行
 # ---------------------------------------------------------------------------
 
 async def run_one(
     case: EvalCase,
     timeout: float = 180.0,
-    rate_limit_wait: float = 70.0,
+    rate_limit_wait: float = 60.0,
     max_retries: int = 3,
 ) -> dict:
     """跑一个用例，返回执行结果（含捕获到的工具/结果与判分）
 
-    限流退避：用例错误里含 429（TPM 超限）时等待 rate_limit_wait 秒再整体重试。
+    限流退避（指数）：用例错误里含 429（TPM 超限）时按指数退避等待后整体
+    重试——第 n 次重试（0 起）等待 rate_limit_wait * 2^n 秒（默认 60→120→240）。
     被拒请求也占限流窗口，SDK 内置的秒级快速重试只会自我续满窗口，
-    必须长等待让整个滑动窗口排空后再试。
+    必须长等待让整个滑动窗口排空后再试；固定短等待会把重试额度烧光。
     每次尝试使用全新 thread_id：checkpoint 记忆不跨尝试/跨轮次泄漏
     （warm-start 会让模型凭会话记忆直接作答、不再调用工具，污染基线）。
+    返回的 run 里带 rate_limited 标记：主流程据此在下一用例前追加短冷却。
     """
     run: dict = {}
+    rate_limited = False
     for attempt in range(max_retries + 1):
         box, restore = _capture_for_case()
         thread_id = f"eval-{case.id}-{uuid.uuid4().hex[:8]}"
@@ -130,15 +151,20 @@ async def run_one(
             "tokens_used": int(tokens_used),
         }
 
-        if any("429" in e for e in box["errors"]) and attempt < max_retries:
+        if has_rate_limit_error(box["errors"]) and attempt < max_retries:
+            wait_seconds = rate_limit_backoff_seconds(rate_limit_wait, attempt)
+            rate_limited = True
             print(
-                f"    ... TPM 限流，等待 {rate_limit_wait:.0f}s 后重试"
+                f"    ... TPM 限流，等待 {wait_seconds:.0f}s 后重试"
                 f"（第 {attempt + 1}/{max_retries} 次）",
                 flush=True,
             )
-            await asyncio.sleep(rate_limit_wait)
+            await asyncio.sleep(wait_seconds)
             continue
         break
+
+    # 主流程据此在发生过限流的用例之后追加短冷却（避免连环触发 429）
+    run["rate_limited"] = rate_limited
 
     return run
 
@@ -223,6 +249,20 @@ async def _run_all(args) -> int:
         if run["errors"]:
             print(f"    errors: {run['errors']}")
 
+        # 限流后短冷却：刚经历退避重试说明账户正顶在 TPM 窗口边缘，
+        # 立刻跑下一条用例容易连环触发 429，追加短冷却让窗口排空
+        if (
+            i < len(cases)
+            and run.get("rate_limited")
+            and args.rate_limit_cooldown > 0
+        ):
+            print(
+                f"    ... 本用例发生过 TPM 限流，"
+                f"冷却 {args.rate_limit_cooldown:.0f}s 后继续",
+                flush=True,
+            )
+            await asyncio.sleep(args.rate_limit_cooldown)
+
         # 用例间限速：每条用例瞬时消耗 1.6-2.5 万 token，会顶到账户 TPM
         # 上限（L0 等级 2-8 万/模型），连续背靠背必触发 429
         if i < len(cases) and args.pause > 0:
@@ -277,8 +317,10 @@ def main():
                    help="用例间隔秒数（限速防 429），默认 5")
     p.add_argument("--retries", type=int, default=3,
                    help="429 限流时单条用例最大重试次数，默认 3")
-    p.add_argument("--rate-limit-wait", type=float, default=70.0,
-                   help="429 退避等待秒数（需大于一个限流窗口），默认 70")
+    p.add_argument("--rate-limit-wait", type=float, default=60.0,
+                   help="429 指数退避基准秒数（重试依次 60→120→240），默认 60")
+    p.add_argument("--rate-limit-cooldown", type=float, default=30.0,
+                   help="用例发生限流后、下一用例开始前的短冷却秒数，默认 30")
     p.add_argument("--out", help="JSON 报告输出路径")
     args = p.parse_args()
     sys.exit(asyncio.run(main_async(args)))
