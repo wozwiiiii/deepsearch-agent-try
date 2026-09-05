@@ -1,0 +1,213 @@
+{
+  "generated_at": "2026-09-05T17:27:10.829974",
+  "total": 6,
+  "cases": [
+    {
+      "id": "route-01-db-routing",
+      "category": "routing",
+      "query": "查询数据库里治疗领域为高血压的药品有哪些，只看数据库，不用网络。",
+      "started_at": "2026-09-05T17:28:38.399043",
+      "result": "数据库中治疗领域为高血压的药品包括：\n\n- 硝苯地平控释片（拜新同）\n- 氯沙坦钾片（科素亚）\n- 苯磺酸氨氯地平片（络活喜）\n- 缬沙坦胶囊（代文）",
+      "tools": [
+        "数据库表名查询工具：list_sql_tables",
+        "数据库表数据查询工具：get_table_data",
+        "数据库表数据查询工具：execute_sql_query"
+      ],
+      "assistants": [
+        "数据库查询助手"
+      ],
+      "errors": [],
+      "tokens_used": 16398,
+      "verdict": {
+        "pass": true,
+        "score": 1.0,
+        "detail": {
+          "tools_seen": [
+            "数据库表名查询工具：list_sql_tables",
+            "数据库表数据查询工具：get_table_data",
+            "数据库表数据查询工具：execute_sql_query"
+          ],
+          "assistants_seen": [
+            "数据库查询助手"
+          ],
+          "hit_tool": true,
+          "hit_assistant": true
+        }
+      }
+    },
+    {
+      "id": "route-02-web-routing",
+      "category": "routing",
+      "query": "用网络搜索一下奥司他韦治疗流感的最新临床指南，不要查数据库。",
+      "started_at": "2026-09-05T17:29:39.915565",
+      "result": "根据网络搜索结果，以下是一些关于奥司他韦治疗流感的最新临床指南的信息：\n\n1. **中国流感治疗与药物预防临床实践指南（2025版）**\n   - **发布机构**：中华医学杂志。\n   - **发布日期**：2025年12月4日。\n   - **关键推荐**：\n      - 奥司他韦是预防流感病毒感染的首选药物，对其暴露前预防的保护效力达到了74%。\n      - 对于高危人群，例如有免疫功能低下等因素的患者，建议在发病48小时内或超过48小时后均应立即启动抗病毒治疗，即使病情已经发展超过48小时，仍然需要进行抗病毒治疗。\n      - 奥司他韦可能引起的常见不良反应有轻度的恶心、呕吐等，总体上耐受性尚可。对于出现流感症状且接受了暴露前预防的患者，如果症状持续或加重，应改用治疗剂量继续进行治疗。\n      - 指南不推荐使用扎那米韦，因为它在我国可获得性较低。\n\n2. **中国流感治疗与药物预防基层指南（2025版）**\n   - **发布机构**：中华医学会呼吸病学分会及中华医学会感染病学会分会。\n   - **发布日期**：未给出具体日期，原文指需在链接访问指南中查看。\n   - **关键推荐**：\n      - 提供了奥司他韦在不同人群，特别是儿童、孕妇、产后患者中的使用剂量和方法，推荐剂量和疗程如上所列。\n\n这些指南提供了详细的用药推荐及使用奥司他韦的一些注意事项。由于两个指南都侧重不同的内容和人群，你可以根据自己的需求和患者的具体情况来参考这些内容。",
+      "tools": [
+        "网络搜索工具"
+      ],
+      "assistants": [
+        "网络搜索助手"
+      ],
+      "errors": [],
+      "tokens_used": 17268,
+      "verdict": {
+        "pass": true,
+        "score": 1.0,
+        "detail": {
+          "tools_seen": [
+            "网络搜索工具"
+          ],
+          "assistants_seen": [
+            "网络搜索助手"
+          ],
+          "hit_tool": false,
+          "hit_assistant": true
+        }
+      }
+    },
+    {
+      "id": "route-03-knowledge-base",
+      "category": "routing",
+      "query": "查询公司内部知识库里关于药品仓储管理制度的规定内容。",
+      "started_at": "2026-09-05T17:30:56.888825",
+      "result": "由于暂时无法查询到公司内部知识库中关于药品仓储管理制度的规定内容，请稍后再试或联系系统管理员获取相关信息。",
+      "tools": [
+        "ragflow聊天助手列表查询工具：get_assistant_list"
+      ],
+      "assistants": [
+        "RAGFlow助手"
+      ],
+      "errors": [],
+      "tokens_used": 16342,
+      "verdict": {
+        "pass": true,
+        "score": 1.0,
+        "detail": {
+          "tools_seen": [
+            "ragflow聊天助手列表查询工具：get_assistant_list"
+          ],
+          "assistants_seen": [
+            "RAGFlow助手"
+          ],
+          "hit_tool": false,
+          "hit_assistant": true
+        }
+      }
+    },
+    {
+      "id": "route-04-markdown-gen",
+      "category": "routing",
+      "query": "根据查到的库存数据，生成一份 Markdown 格式的库存周报。",
+      "started_at": "2026-09-05T17:31:49.078723",
+      "result": "根据数据库查询助手提供的库存数据，我们将完成库存周报的Markdown文件生成。现在我们可以编写文件了。\n\n我们将使用获取到的信息创建库存周报Markdown格式的文档，请注意文件的格式应包括一个标题，内容清晰，最后还会有日期和免责声明。\n\n下面就是我们即将生成的Markdown文件内容：\n\n---\n\n# 库存周报 - 2026-09-05\n\n以下是库存数据详情，包括药品名称、库存数量以及上次更新时间：\n\n| 药品名称 | 库存数量 | 上次更新时间 |\n| ------------ | ----------- | ------------ |\n| 阿莫西林胶囊（阿莫仙） | 12000 | 2026-09-05 11:35:52 |\n| 布洛芬缓释胶囊（芬必得） | 30000 | 2026-09-05 11:35:52 |\n| 盐酸二甲双胍片（格华止） | 6000 | 2026-09-05 11:35:52 |\n| 阿托伐他汀钙片（立普妥） | 4000 | 2026-09-05 11:35:52 |\n| 磷酸奥司他韦胶囊（达菲） | 20000 | 2026-09-05 11:35:52 |\n| 注射用头孢曲松钠（罗氏芬） | 5000 | 2026-09-05 11:35:52 |\n| 蒙脱石散（思密达） | 12000 | 2026-09-05 11:35:52 |\n| 硝苯地平控释片（拜新同） | 5000 | 2026-09-05 11:35:52 |\n| 阿司匹林肠溶片（拜阿司匹灵） | 7000 | 2026-09-05 11:35:52 |\n\n- 更多的药品信息请参考上述表格。\n\n**免责声明：**\n本报告的数据来源自实际情况，但不保证信息的精确性。所有内容仅供参考，不得作为决策的依据。\n\n---\n\n现在，我将此内容转化为Markdown文件。\n\n",
+      "tools": [
+        "数据库表名查询工具：list_sql_tables",
+        "数据库表数据查询工具：get_table_data",
+        "数据库表数据查询工具：execute_sql_query",
+        "数据库表数据查询工具：get_table_data",
+        "数据库表数据查询工具：execute_sql_query"
+      ],
+      "assistants": [
+        "数据库查询助手"
+      ],
+      "errors": [],
+      "tokens_used": 17824,
+      "verdict": {
+        "pass": false,
+        "score": 0.0,
+        "detail": {
+          "tools_seen": [
+            "数据库表名查询工具：list_sql_tables",
+            "数据库表数据查询工具：get_table_data",
+            "数据库表数据查询工具：execute_sql_query",
+            "数据库表数据查询工具：get_table_data",
+            "数据库表数据查询工具：execute_sql_query"
+          ],
+          "assistants_seen": [
+            "数据库查询助手"
+          ],
+          "hit_tool": false,
+          "hit_assistant": false
+        }
+      }
+    },
+    {
+      "id": "route-05-negative-routing",
+      "category": "routing",
+      "query": "不要查数据库，只用网络搜索最新的奥司他韦耐药性研究进展。",
+      "started_at": "2026-09-05T17:33:40.711958",
+      "result": "根据最新的网络搜索信息，奥司他韦的耐药性研究具有以下几个关键点：\n\n1. 针对A（H1N1）pdm09分离株，流感研究数据显示大约有1%~1.5%的耐药性，这与病毒神经氨酸酶蛋白中的H275Y突变有关。在大多数情况下奥司他韦仍然是有效的，但对特定高危人群（如免疫缺陷患者）的疗效可能减弱。\n\n2. 对于奥司他韦耐药的流感病毒，药物法匹拉韦展现了抗病毒活性，这表明它可能作为一种备选治疗选项对抗耐药病毒株。\n\n3. 最近的监测数据表明，现在的许多流感病毒株尚未对奥司他韦等神经氨酸酶抑制剂产生耐药性；但是，对于像玛巴洛沙韦这样的新型抗流感药物，有报道显示出耐药性病例的存在。\n\n总结来说，尽管奥司他韦耐药性目前还未成为普遍现象，但在特定情况下仍需要警惕。针对耐药性流感病毒的新型药物研发仍在进行中。总体来看，奥司他韦的耐药性情况目前仍较为可控。",
+      "tools": [
+        "网络搜索工具"
+      ],
+      "assistants": [
+        "网络搜索助手"
+      ],
+      "errors": [],
+      "tokens_used": 16930,
+      "verdict": {
+        "pass": true,
+        "score": 1.0,
+        "detail": {
+          "tools_seen": [
+            "网络搜索工具"
+          ],
+          "assistants_seen": [
+            "网络搜索助手"
+          ],
+          "hit_tool": false,
+          "hit_assistant": true
+        }
+      }
+    },
+    {
+      "id": "route-06-db-web-combo",
+      "category": "routing",
+      "query": "先查数据库里达格列净的库存和销售情况，再用网络补充它的临床研究新进展。",
+      "started_at": "2026-09-05T17:40:07.167251",
+      "result": null,
+      "tools": [
+        "数据库表名查询工具：list_sql_tables",
+        "网络搜索工具",
+        "数据库表数据查询工具：get_table_data",
+        "数据库表数据查询工具：get_table_data",
+        "数据库表数据查询工具：get_table_data",
+        "数据库表数据查询工具：execute_sql_query"
+      ],
+      "assistants": [
+        "数据库查询助手",
+        "网络搜索助手"
+      ],
+      "errors": [
+        "执行主智能发生异常信息：Error code: 429 - {'code': 50602, 'message': 'Request was rejected due to rate limiting. Details: TPM limit reached.', 'data': None}"
+      ],
+      "tokens_used": 0,
+      "verdict": {
+        "pass": true,
+        "score": 1.0,
+        "detail": {
+          "tools_seen": [
+            "数据库表名查询工具：list_sql_tables",
+            "网络搜索工具",
+            "数据库表数据查询工具：get_table_data",
+            "数据库表数据查询工具：get_table_data",
+            "数据库表数据查询工具：get_table_data",
+            "数据库表数据查询工具：execute_sql_query"
+          ],
+          "assistants_seen": [
+            "数据库查询助手",
+            "网络搜索助手"
+          ],
+          "hit_tool": false,
+          "hit_assistant": true
+        }
+      },
+      "contaminated": true,
+      "contamination_reason": "rate_limit_429"
+    }
+  ],
+  "passed": 5,
+  "pass_rate": 0.833,
+  "total_tokens": 84762,
+  "rejudged_at": "2026-09-05T18:00:25.470103",
+  "note": "污染用例标记 contaminated（429 限流/超时/Tavily 搜索故障未获公平评测）。"
+}

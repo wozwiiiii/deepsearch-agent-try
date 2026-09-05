@@ -1,0 +1,37 @@
+{
+  "generated_at": "2026-09-05T15:48:22.342673",
+  "total": 1,
+  "cases": [
+    {
+      "id": "sql-19-max-unit-price",
+      "category": "sql",
+      "query": "数据库里销售单价最高的药品是哪一种？",
+      "started_at": "2026-09-05T15:48:22.342673",
+      "result": "数据库查询结果显示，销售单价最高的药品是“韦瑞德”。\n\n您是否需要我将这条信息生成为文件？如果需要，请告诉我您希望的文件格式（Markdown 或 PDF）。",
+      "tools": [
+        "数据库表名查询工具：list_sql_tables",
+        "数据库表数据查询工具：get_table_data",
+        "数据库表数据查询工具：get_table_data",
+        "数据库表数据查询工具：execute_sql_query"
+      ],
+      "assistants": [
+        "数据库查询助手"
+      ],
+      "errors": [],
+      "tokens_used": 16207,
+      "verdict": {
+        "pass": false,
+        "score": 0.0,
+        "detail": {
+          "matched": [],
+          "missing": [
+            "替诺福韦"
+          ]
+        }
+      }
+    }
+  ],
+  "passed": 0,
+  "pass_rate": 0.0,
+  "total_tokens": 16207
+}

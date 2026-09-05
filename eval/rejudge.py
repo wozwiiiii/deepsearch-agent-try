@@ -1,7 +1,8 @@
 """评测报告离线后处理：污染标记 + 判分修正（不重跑 Agent，零 API 成本）
 
 背景（首轮基线 2026-09-05 实测暴露）：
-1. 部分用例因外部资源故障未获公平评测（硅基流动 429 限流、超时），
+1. 部分用例因外部资源故障未获公平评测（硅基流动 429 限流、超时、
+   Tavily 搜索代理连接失败 ProxyError），
    需打 `contaminated` 标记，统计与补测决策时单独看待；
 2. judge 自身缺陷导致误判：sql 类数字千分位/小数尾零（"160,000" vs
    "160000"）、multi 类 judge LLM 输出 JSON 解析失败兜底 0 分。
@@ -43,6 +44,9 @@ def _contamination_reason(errors: list[str]) -> str | None:
         return "rate_limit_429"
     if "超时" in text or "timed out" in text:
         return "timeout"
+    if "ProxyError" in text or "tavily.com" in text:
+        # Tavily 搜索经代理连接失败：外部搜索服务故障，非智能体缺陷
+        return "external_search_down"
     return None
 
 
@@ -57,6 +61,24 @@ def mark_contamination(case: dict) -> bool:
         changed = True
     if case.get("contamination_reason") != reason:
         case["contamination_reason"] = reason
+        changed = True
+    return changed
+
+
+def mark_manual(case: dict, reason: str, evidence: str) -> bool:
+    """人工标记通道：报告内 errors 无法自动判定、但运行日志有明确证据时使用。
+
+    必须提供 evidence（标注依据），保证可审计。返回是否有变更。
+    """
+    changed = False
+    if not case.get("contaminated"):
+        case["contaminated"] = True
+        changed = True
+    if case.get("contamination_reason") != reason:
+        case["contamination_reason"] = reason
+        changed = True
+    if case.get("contamination_evidence") != evidence:
+        case["contamination_evidence"] = evidence
         changed = True
     return changed
 
@@ -127,20 +149,26 @@ _NOTE_MULTI = (
     "judge LLM 解析失败用例重判 + 污染用例标记（离线，未重跑 Agent）。"
     "原始判定保留在各用例 verdict_prev，可审计。"
 )
-_NOTE_MARK_ONLY = "污染用例标记 contaminated（429 限流/超时未获公平评测）。"
+_NOTE_MARK_ONLY = "污染用例标记 contaminated（429 限流/超时/Tavily 搜索故障未获公平评测）。"
 
 
-def process(path: str, allow_llm: bool) -> int:
+def process(path: str, allow_llm: bool, manual_marks: dict[str, tuple[str, str]] | None = None) -> int:
     report_path = Path(path)
     report = json.loads(report_path.read_text(encoding="utf-8"))
     cases = report.get("cases", [])
     category = cases[0].get("category") if cases else None
+    manual_marks = manual_marks or {}
 
     n_marked = n_rejudged = 0
     for case in cases:
         if mark_contamination(case):
             n_marked += 1
             print(f"  [mark] {case['id']}: contaminated ({case.get('contamination_reason')})")
+        if case["id"] in manual_marks:
+            reason, evidence = manual_marks[case["id"]]
+            if mark_manual(case, reason, evidence):
+                n_marked += 1
+                print(f"  [mark-manual] {case['id']}: contaminated ({reason}) 依据: {evidence}")
         if category == "sql" and rejudge_sql(case):
             n_rejudged += 1
             print(f"  [rejudge] {case['id']}: {case['verdict_prev'].get('pass')} -> {case['verdict'].get('pass')}")
@@ -181,10 +209,25 @@ def main() -> int:
     p.add_argument("reports", nargs="+", help="评测报告 JSON 路径")
     p.add_argument("--no-llm", action="store_true",
                    help="不调用 judge LLM（仅确定性重判与标记）")
+    p.add_argument("--mark", action="append", default=[],
+                   metavar="CASE_ID:REASON[:EVIDENCE]",
+                   help="人工标记污染（报告内 errors 无法自动判定时；"
+                        "evidence 建议提供，作为标注依据写入 contamination_evidence）")
     args = p.parse_args()
+
+    manual_marks: dict[str, tuple[str, str]] = {}
+    for m in args.mark:
+        parts = m.split(":", 2)
+        if len(parts) < 2:
+            print(f"--mark 格式错误（应为 CASE_ID:REASON[:EVIDENCE]）：{m}")
+            return 1
+        cid, reason = parts[0], parts[1]
+        evidence = parts[2] if len(parts) > 2 else "人工标注（未提供依据）"
+        manual_marks[cid] = (reason, evidence)
+
     for r in args.reports:
         print(f"处理 {r}:")
-        ret = process(r, allow_llm=not args.no_llm)
+        ret = process(r, allow_llm=not args.no_llm, manual_marks=manual_marks)
         if ret != 0:
             return ret
     return 0
