@@ -52,11 +52,14 @@ def internet_search(
     )
 
     # Tavily 返回 query、results、title、url、content 等结构化字段，后续由子智能体阅读并汇总
+    # timeout=20：网络半开时 HTTP 可能无限期挂起，LangChain 线程池中的工作线程会被永久占用；
+    # 给单次搜索固定 20s 上限，超时即抛错让线程及时归还线程池
     return tavily_client.search(
         query=query,
         topic=topic,
         max_results=max_results,
         include_raw_content=include_raw_content,
+        timeout=20,
     )
 
 

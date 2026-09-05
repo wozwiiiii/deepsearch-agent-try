@@ -166,6 +166,10 @@ def get_db_config():
         "collation": os.getenv("MYSQL_COLLATION", "utf8mb4_unicode_ci"),
         "autocommit": True,
         "sql_mode": os.getenv("MYSQL_SQL_MODE", "TRADITIONAL"),
+        # connection_timeout=10：TCP 连接阶段的超时（秒），网络半开时避免 connect()
+        # 无限期阻塞而永久占用 LangChain 线程池工作线程。仅约束建连，不影响查询阶段；
+        # mysql-connector-python 对查询阶段缺少可靠的超时控制，属已知边界
+        "connection_timeout": 10,
     }
 
     # 去掉未配置的可选项，避免把 None 传给 mysql.connector 造成连接参数异常

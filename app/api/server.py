@@ -57,6 +57,9 @@ from app.api.auth import (
 )
 from app.api.event_store import event_store
 from app.api.monitor import manager
+from app.utils.logging_setup import get_logger, setup_logging
+
+logger = get_logger(__name__)
 
 # ---------------------------------------------------------------------------
 # 安全校验常量与工具函数
@@ -216,23 +219,25 @@ async def lifespan(_app: FastAPI):
     启动时绑定当前事件循环到 WebSocket 管理器，确保后台 Agent 任务可以把
     monitor 事件投递回 FastAPI 所在的 loop；同时检查认证配置并给出醒目提示。
     """
+    # 先让 root logger 输出统一 JSON（含 trace_id/user_id/thread_id），
+    # 再开始打启动日志，保证后续所有运行日志都走结构化格式
+    setup_logging()
+
     loop = asyncio.get_running_loop()
     manager.set_loop(loop)
-    print(f"[Server] WebSocket Manager bound to loop: {id(loop)}")
+    logger.info(f"[Server] WebSocket Manager bound to loop: {id(loop)}")
 
     # 启动时显式暴露认证配置状态，避免"忘配密钥裸奔"或"拒绝服务"排查困难
     if os.getenv("API_KEYS", "").strip():
-        print(f"[Server] 认证已启用：API_KEYS 已配置")
+        logger.info("[Server] 认证已启用：API_KEYS 已配置")
     elif is_dev_mode_enabled():
-        print(
-            "=" * 68 + "\n"
+        logger.warning(
             "[Server][警告] 开发模式运行中：未配置 API_KEYS，所有请求归属 local 用户。\n"
             "[Server][警告] 该模式仅限本地联调，禁止暴露到公网。\n"
-            "[Server][警告] 部署前请在 .env 配置 API_KEYS=用户名:密钥 并移除 ALLOW_DEV_MODE。\n"
-            + "=" * 68
+            "[Server][警告] 部署前请在 .env 配置 API_KEYS=用户名:密钥 并移除 ALLOW_DEV_MODE。"
         )
     else:
-        print(
+        logger.error(
             "[Server][错误] 未配置 API_KEYS 且未设置 ALLOW_DEV_MODE=1，"
             "所有业务接口将返回 503。请配置 API_KEYS 后重启。"
         )
@@ -595,7 +600,7 @@ async def websocket_endpoint(websocket: WebSocket, thread_id: str):
         replayed = await event_store.read_after(routing_key, last_seq)
     except Exception as e:
         # 事件库故障不阻断连接：降级为无回放的纯实时模式
-        print(f"[WebSocket] 事件回放读取失败（降级为纯实时模式）: {e}")
+        logger.warning(f"[WebSocket] 事件回放读取失败（降级为纯实时模式）: {e}")
         replayed = []
     for event_payload in replayed:
         await websocket.send_json(event_payload)
@@ -614,10 +619,10 @@ async def websocket_endpoint(websocket: WebSocket, thread_id: str):
     except WebSocketDisconnect:
         # 只移除当前 WebSocket 实例，避免旧连接断开时误删同 thread_id 的新连接
         manager.disconnect(websocket, routing_key)
-        print(f"[WebSocket] 客户端已断开: {routing_key}")
+        logger.info(f"[WebSocket] 客户端已断开: {routing_key}")
 
     except Exception as e:
-        print(f"[WebSocket] 连接异常: {e}")
+        logger.error(f"[WebSocket] 连接异常: {e}", exc_info=True)
         manager.disconnect(websocket, routing_key)
 
 

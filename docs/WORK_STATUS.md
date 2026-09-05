@@ -1,111 +1,156 @@
 # deepsearch-agents 工作状态报告
 
-> **更新时间**：2026-08-30
-> **分支**：`production-hardening`（基于 `main` 分支）
-> **最新提交**：`9f04b45` 评测集最小版 + P0-2/P0-3 设计方案（第四批事件回放为未提交工作区改动）
+> **更新时间**：2026-09-05
+> **分支**：`main`（仓库唯一分支，**无 `production-hardening` 分支**）
+> **HEAD**：`4aebb83`
+> **远端**：`origin` = `wozwiiiii/deepsearch-agent-try`；本地 `main` 领先 `origin/main`（`f4f1995`）**7 个提交，已提交未推送**
+> **工作区**：干净（`git status` 无输出）
 
 ---
 
-## 一、整体进度概览
+## 一、仓库来源与增量口径（2026-09-05 实测更正）
 
-| 阶段 | 状态 | 提交 |
+**此前文档称"增量在 `production-hardening` 分支、`git diff main` 可看全部增量"——该说法已失效，实测更正如下：**
+
+| 项 | 实测 | 说明 |
+|----|------|------|
+| 分支 | 仅 `main` | `git branch -a` 只有 `main` 与 `origin/main`；`production-hardening` **不存在** |
+| 上游基线 | `df6d52e`（didilili，2026-05-18） | 上游最后一笔；此前 20 笔作者均为 didilili |
+| 本人增量 | 18 笔（`d0f6eed` → `4aebb83`） | 全量 38 笔 = didilili 20 + wozwiiiii 18 |
+| 查看增量 | `git diff df6d52e..HEAD` | **`git diff main` 恒为空**（增量已在 main 上，不可再用） |
+
+**增量规模（多口径，引用时须指明口径）**：
+
+| 口径 | 命令 | 结果 |
 |------|------|------|
-| 第一批：安全加固（路径/SQL/会话隔离） | ✅ 已提交 | `d0f6eed` → `70f3162` |
-| 第二批：认证 + 多租户 + SQLite 持久化 | ✅ 已提交 | `d2bc74e` |
-| 第三批：限流 + fail-closed + 模型调用上限 + 审查修复 | ✅ 已提交 | `62f13ab` |
-| UNION 等集合操作补 LIMIT + 测试数同步 | ✅ 已提交 | `3ccd40b` |
-| 评测集最小版 + P0-2/P0-3 设计方案 | ✅ 已提交 | `9f04b45` |
-| 第四批：P0-3 事件回放 + 审查修复 + P1-4 任务硬超时 | ✅ 已提交 | `6b4a5dc` |
-| P1-4a：单任务 token 预算熔断 | ✅ 已提交 | `f741fb6` |
-| P1-2：短时链接令牌（密钥不进 URL） | ✅ 已完成，**未提交** | 本轮增量 |
-| 面试文档（5 份） | ✅ 已同步（154 测试） | — |
+| 全量增量 | `git diff --shortstat df6d52e..HEAD` | 53 文件，**+6193 / −546** |
+| 生产化改造（自 `70f3162` 起） | `git diff --shortstat 70f3162^..HEAD` | 51 文件，+6191 / −544 |
+| 排除 lock 文件 | 同上 + `':(exclude)uv.lock'` | 52 文件，+6025 / −543 |
+| 本轮 7 笔 | `git diff --shortstat c11fd2b^..HEAD` | 17 文件，**+531 / −116** |
+
+> 此前文档写的"40 文件 / +3649 / −209"是中间时点的旧统计，已由上表取代。
 
 ---
 
-## 二、第四批改动清单（P0-3 事件回放 + 审查修复 + P1-4 硬超时已提交 6b4a5dc；P1-4a token 预算 f741fb6；P1-2 短时令牌为本轮未提交增量）
+## 二、提交脉络（38 笔，时间正序）
 
-### 2.1 改动内容
+### 2.1 上游底座（didilili，20 笔）
 
-| 文件 | 变更 | 说明 |
+`9d92662`（2026-05-08 首次提交）→ … → `df6d52e`（2026-05-18"正式上线"）。对应教程"深度研搜"实战。
+
+### 2.2 本人增量（18 笔）
+
+| 提交 | 内容 | 批次 |
 |------|------|------|
-| `app/api/event_store.py`（新增） | ~200 行 | SQLite 事件库：`append` 返回全局自增 seq（等价 XADD），`read_after` 差量读取（等价 XREAD），按 `EVENT_MAX_PER_STREAM` 裁剪（等价 MAXLEN）；与 Redis Stream 语义一一对应，P0-2 时可整体替换实现 |
-| `app/api/monitor.py` | 重构 `_emit` | 事件先落库拿 seq 再推 WS；持久化失败降级为不可回放，不阻塞实时推送；`ConnectionManager.register` 与 accept 分离（补发完成后才注册实时推送，防乱序） |
-| `app/api/server.py` | WS 端点 | 握手支持 `last_seq`（非法值 1008 拒绝）；先补发差量再注册；首次连接补发最近 `EVENT_REPLAY_LIMIT` 条 |
-| `frontend/src/hooks/useDeepAgentSession.ts` | +退避/补发 | 指数退避 + 抖动（2s→60s 上限）；seq 跳号主动重连补发（限 3 次）；补发事件跳过跳号检测；重叠窗口按 seq 去重 |
-| `frontend/src/types.ts` | 类型 | `MonitorMessage` 增加 `seq` / `replay` 字段 |
-| `tests/test_event_replay.py`（新增） | 14 用例 | 存储层（seq/差量/隔离/裁剪/重启可读/并发有序）、monitor 落库、WS 补发协议、租户回放隔离 |
-| `app/agent/main_agent.py` | P1-4 硬超时 + P1-4a token 预算 | 流式消费抽为 `_consume_agent_stream`，`asyncio.wait_for(TASK_TIMEOUT_SECONDS=600)` 包住整个执行（含初始化）；流内累计 `usage_metadata`，超 `MODEL_TOKEN_RUN_LIMIT`（默认 150 万）熔断终止 |
-| `tests/test_checkpointer.py` | +4 用例 | 任务超时 2（挂起终止上报、初始化覆盖）+ token 预算 2（超限熔断、预算内含兜底求和） |
-| `tests/conftest.py` | 环境隔离 | `EVENT_DB` 指向系统临时目录，测试不写真实 `app/data/`；令牌限流测试默认放开 |
-| `pyproject.toml` / `.env.example` / `.gitignore` | 配套 | 显式声明 `aiosqlite`；新增事件回放 3 个 + `TASK_TIMEOUT_SECONDS`/`MODEL_TOKEN_RUN_LIMIT`/`LINK_TOKEN_TTL_SECONDS`/`RATE_LIMIT_TOKEN` 环境变量；忽略本地 pnpm store |
+| `d0f6eed` | 修正错误的文件夹命名 | 前置 |
+| `70f3162` | **第一批** 安全加固：路径穿越 / SQL 只读 / 接口会话隔离，76 项安全测试 | 第一批 |
+| `d2bc74e` | **第二批** API Key 认证 + 多租户复合键隔离 + SQLite 持久化 checkpointer | 第二批 |
+| `62f13ab` | **第三批** 接口限流 + fail-closed + 模型调用上限 + 审查修复 | 第三批 |
+| `3ccd40b` | UNION 等集合操作补 LIMIT + 测试数同步 125→129 | 修复 |
+| `9f04b45` | 评测集最小版 + P0-2/P0-3 设计方案 + 使用纠错指南 | 第四批前 |
+| `6b4a5dc` | **第四批** P0-3 事件回放 + 任务硬超时 + 审查修复 | 第四批 |
+| `f741fb6` | P1-4a 单任务 token 预算熔断 | 增量 |
+| `2a0db27` | P1-2 短时链接令牌（密钥不进 URL） | 增量 |
+| `64c8aa9` / `4d41d02` / `f4f1995` | CODE_WIKI 文档、README 更新、CI 处理 | 文档 |
+| `c11fd2b` | **P0-3** 修正主智能体提示词与真实工具能力的矛盾 | 本轮 |
+| `c0b5b45` | **P0-4** 同步 I/O 与 LLM 调用加超时/重试，防线程池耗尽 | 本轮 |
+| `9506b8a` | **P1** 统一结构化日志，trace_id 贯穿 | 本轮 |
+| `66f85e9` | 评测集 20 → 45 条 | 本轮 |
+| `b1d7774` | 修正提示词"你你"笔误 | 本轮 |
+| `3e91737` | CI 接入评测集结构自检 + 重复 id 断言 | 本轮 |
+| `4aebb83` | 设计文档 Markdown 格式化（无内容变化） | 本轮 |
 
-**P1-2 短时链接令牌（本轮未提交增量）**：消除"API Key 经查询参数传输"的已知取舍——
+### 2.3 本轮 7 笔细节（领先远端，未推送）
 
-- `POST /api/token`（请求头认证 + 限流）签发 60 秒令牌；WS 握手改用令牌；
-- 下载改 fetch + 请求头 + blob（密钥彻底不进 URL）；
-- 令牌归属签发租户，隔离与密钥一致；`api_key` 查询参数保留为兼容旧入口（前端已不发送）；
-- 验证：`test_auth.py::TestLinkTokens` 7 个用例。
-
-**第四批代码审查修复**（对上述增量做正式审查后）：
-
-| # | 问题 | 修复 |
-|---|------|------|
-| R-1 | 前端补发预算被事件风暴烧穿（close 到 onclose 间每条事件各耗一次预算） | resync pending 期间丢弃实时事件 |
-| R-2 | 显式 last_seq 差量补发被 replay_limit=100 截断，大间隙需多轮补发且烧穿预算 | 差量上限放宽到 max_per_stream |
-| R-3 | 每条事件 commit 两次，多一次 WAL fsync | 合并单事务 |
-| R-4 | `ConnectionManager.connect` 死代码 | 删除 |
-| 证伪 | asyncio.Lock 跨循环绑定（探针实证不成立，记录不修） | — |
-
-### 2.2 验证结果
-
-- 后端：**154 个用例全部通过**（原 129 + 事件回放 14 + 任务超时 2 + token 预算 2 + 链接令牌 7，`.venv/Scripts/python.exe -m pytest tests/ -q`，约 7 秒）
-- 前端：`tsc -b` 零错误（注：`frontend/node_modules` 因项目目录迁移 junction 失效，已用 `pnpm install --store-dir ./.pnpm-store-local` 重装修复）
-
-### 2.3 已知边界（如实标注）
-
-- 补发读取与实时注册间存在毫秒级窗口，由前端 seq 跳号检测兜底；
-- WS 背压下推送顺序与 seq 顺序理论上可倒置，前端跳号检测→补发闭环自愈（协议以 seq 为准）；
-- 多副本事件广播仍需 P0-2（本批只解决单进程持久化与回放）；
-- 事件库无 TTL 清理，只有条数裁剪（每 task_key 保留最近 1000 条）。
+| 提交 | 文件 | 关键改动 |
+|------|------|----------|
+| `c11fd2b` | `app/prompt/prompts.yml` | 主智能体 system_prompt 三处矛盾：删除指向不存在的"文件生成助手"的路由、移除无对应工具的 Word 承诺、消除"不能自己生成"与"工具在你手上"的自我否定。与 `main_agent.py` 真实 `tools=[generate_markdown, convert_md_to_pdf, read_file_content]` 对齐 |
+| `c0b5b45` | `tavily_tool.py` / `llm.py` / `db_tools.py` | Tavily `timeout=20`；`init_chat_model(max_retries=2)`；MySQL `connection_timeout=10`。零新依赖 |
+| `9506b8a` | `logging_setup.py`(新) / `context.py` / 6 个调用方 | `JsonFormatter` + `TraceContextFilter`（contextvars 注入 trace_id/user_id/thread_id，缺失填 `-`）；`reset_session_context` 加可选 token 参数保持向后兼容 |
+| `66f85e9` | `eval/cases.py` | 20 → 45 条：sql 22 / routing 6 / web 10 / multi 7。既有 20 条零改动 |
+| `b1d7774` | `app/prompt/prompts.yml` | 第 33 行"你你掌握的工具"→"你掌握的工具" |
+| `3e91737` | `.github/workflows/ci.yml` / `eval/cases.py` | CI 加 `python eval/cases.py` 步骤；自检补重复 id 断言 |
+| `4aebb83` | `EVENT_REPLAY_DESIGN.md` / `TASK_QUEUE_DESIGN.md` | 纯格式化 |
 
 ---
 
-## 三、测试分布
+## 三、代码基线与验证结果（2026-09-05 实测）
 
-| 测试文件 | 用例数 | 覆盖领域 |
-|----------|--------|----------|
-| `tests/test_path_safety.py` | 14 | 路径穿越防御 |
-| `tests/test_sql_guard.py` | 45 | SQL 只读 + 自动 LIMIT + UNION |
-| `tests/test_api_security.py` | 31 | 上传安全 + 会话隔离 + 回滚 |
-| `tests/test_auth.py` | 35 | API Key 认证 + fail-closed + 非 ASCII + 短时链接令牌 |
-| `tests/test_rate_limit.py` | 7 | slowapi 限流 |
-| `tests/test_checkpointer.py` | 8 | SQLite 持久化 + middleware 透传 + 任务硬超时 + token 预算 |
-| `tests/test_event_replay.py` | 14 | 事件回放（存储/落库/补发协议/租户隔离/并发有序） |
-| **合计** | **154** | — |
+| 层次 | 规模 | 验证 |
+|------|------|------|
+| `app/` 后端 | 28 个 `.py` / **3,351 行** | — |
+| `tests/` | 9 个 `.py` / 1,536 行 | **154 用例全部通过**，实测 **28.80s** |
+| `eval/` | 4 个 `.py` / 767 行 | **45 条结构自检通过** |
+| `frontend/src/` | 19 个 `.tsx/.ts` / 2,140 行 | — |
 
----
+> 此前文档写"154 个测试约 10 秒"，实测 **28.80 秒**（`.venv/Scripts/python.exe -m pytest tests/ -q`）。面试表述建议改为"半分钟内"。
 
-## 四、尚未完成的待办项
+**测试分布**：路径 14 / SQL 45 / 接口 31 / 认证与租户·令牌 35 / 限流 7 / 持久化·超时·预算 8 / 事件回放 14 = 154。
 
-| 优先级 | 任务 | 状态 |
-|--------|------|------|
-| **P0** | Git 提交 P1-2 短时链接令牌 | 待提交 |
-| **P0** | P0-2 任务出进程（ARQ + Redis + Postgres，设计方案已写好） | 未实现 |
-| **P1** | 工具网络重试（tenacity）；token 会话级累计预算（run 级已完成）；移除 api_key 兼容入口 | 未实现 |
-| **P2** | 评测集扩到 50 条接 CI；可观测性（结构化日志/OTel）；事件库 TTL 清理 | 长期 |
+**服务端点（8 个）**：`GET /health`、`POST /api/token`、`POST /api/task`、`POST /api/task/{thread_id}/cancel`、`POST /api/upload`、`GET /api/files`、`GET /api/download`、`WS /ws/{thread_id}`。
 
 ---
 
-## 五、企业级差距路线图（长期）
+## 四、能力完成度（15 项，已完成 12）
 
-| # | 差距 | 阻塞性 | 备注 |
+| 域 | 完成 | 明细 |
+|----|------|------|
+| 安全加固 | **6/6** | 路径收容、SQL 三层防护、认证 fail-closed、会话隔离、限流、短时令牌 |
+| 状态与回放 | **2/2** | Checkpoint 持久化、事件回放（seq + last_seq 补发） |
+| 成本与熔断 | **1/1** | 600s 硬超时 + 80 次调用上限 + 150 万 token 预算 |
+| 可观测性 | **1/2** | 结构化日志已落地；**OTel / 指标采集未做** |
+| 质量体系 | **3/3** | 评测集 45 条、CI 结构自检已接；**首轮基线 2026-09-05 跑出：30/45（66.7%）**，见 `EVAL_BASELINE_2026-09-05.md` |
+| 部署架构 | **0/1** | **P0-2 任务出进程未实现** |
+
+---
+
+## 五、两项易被误判的事实（2026-09-05 澄清）
+
+### 5.1 生产路径 `print` 已清零
+
+`grep -rn 'print(' app/` 命中 12 处，但**逐行核对后全部位于 `if __name__ == "__main__":` 演示块内**，不在生产路径：
+
+| 文件 | print 行号 | `__main__` 行号 |
+|------|-----------|----------------|
+| `db_tools.py` | 364 | 362 |
+| `markdown_tools.py` | 89 / 94 / 97 | 80 |
+| `pdf_tools.py` | 108 | 72 |
+| `tavily_tool.py` | 70 | 66 |
+| `upload_file_read_tool.py` | 130 / 131 / 136 / 137 | 121 |
+| `ragflow_tools.py` | 120 / 121 | 已注释 |
+
+**结论：结构化日志改造完整，生产路径 `print` 零残留。** 此前"print 未覆盖"的判断不成立。
+
+### 5.2 CI 接入的是"结构自检"，不是全量评测
+
+`.github/workflows/ci.yml` 执行 `python eval/cases.py`，校验用例 id 唯一性与字段完整性，**不调用真实 Agent**。全量评测需 `OPENAI_API_KEY` + `TAVILY_API_KEY` + MySQL，不稳定且产生费用，刻意不进 CI。
+
+---
+
+## 六、未完成项与阻塞条件
+
+| 优先级 | 任务 | 状态 | 阻塞条件 |
+|--------|------|------|----------|
+| **P0** | P0-2 任务出进程 | **一行未动** | 设计稿 `TASK_QUEUE_DESIGN.md` 完备；需 Redis，估 4–6 天 |
+| ~~P0~~ | ~~评测基线跑分~~ | **已完成（2026-09-05）** | 首轮基线 30/45（66.7%，剔除 4 条污染用例 29/41），成本 ¥0.98。报告：`EVAL_BASELINE_2026-09-05.md` |
+| P1 | 会话级 token 预算 | 未做 | run 级已完成 |
+| P1 | 移除 `api_key` 查询参数兼容入口 | 未做 | 前端已不发送 |
+| P2 | OTel / Prometheus | 未做 | 结构化日志是其前置，已就位 |
+| P2 | 事件库 TTL 清理 | 未做 | 当前只有条数裁剪（每 task_key 保留最近 1000 条） |
+
+**当前最大结构性缺口**：P0-2。任务执行仍为 `asyncio.create_task`（`server.py:348`）跑在 Web 进程内——进程重启即丢失进行中任务，且无法水平扩容。
+
+---
+
+## 七、企业级差距路线图（长期）
+
+| # | 差距 | 阻塞性 | 现状 |
 |---|------|--------|------|
-| 1 | 任务队列与并发治理（P0-2） | 🔴 上线必须 | `asyncio.create_task` → ARQ；事件存储随本批换 Redis Stream |
-| 2 | 可观测性（结构化日志 + OTel + Prometheus） | 🟡 重要 | 替换 `print`，接入 LangSmith/LangFuse |
-| 3 | 评测体系扩量 + CI 回归 | 🟡 重要 | 最小版已建（`eval/` 20 用例） |
-| 4 | Token 级预算熔断 | 🟢 改进 | 当前只有调用次数上限 |
-| 5 | 水平扩容 checkpoint（SQLite → Postgres） | 🟢 改进 | 多副本部署时换 `langgraph-checkpoint-postgres` |
+| 1 | 任务队列与并发治理（P0-2） | 🔴 上线必须 | `create_task` → 需外置队列；事件存储随本批换 Redis Stream |
+| 2 | 可观测性（OTel + Prometheus） | 🟡 重要 | 结构化日志已就位，OTel 未接 |
+| 3 | 评测体系跑分 + 回归 | 🟢 首轮已完成 | 2026-09-05 基线 30/45（66.7%）；后续为按修复迭代重跑对比 |
+| 4 | 水平扩容 checkpoint | 🟢 改进 | SQLite → Postgres（多副本部署时换 `langgraph-checkpoint-postgres`） |
 
 ---
 
-*本报告基于 `production-hardening` 分支工作区状态维护；历史第三批明细见 git 历史（62f13ab）。*
+*本报告数据来自 2026-09-05 实测命令输出（git / grep / pytest / eval 自检），未采信任何文档的自我陈述。引用前请以 `git log` 与命令实测为准。*

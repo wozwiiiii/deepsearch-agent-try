@@ -1,8 +1,11 @@
 # P0-3 WebSocket 事件回放设计方案
 
-> 状态：**已实现（SQLite 版，2026-08-30 第四批）**。本方案中的 seq 序号、last_seq 差量补发、
+> 状态：**已实现（SQLite 版，2026-08-30 第四批）**。本方案中的 seq 序号、last\_seq 差量补发、
 > 前端指数退避、限长裁剪均已落地，实现记录见 `PRODUCTION_NOTES.md` 第四批与
-> `tests/test_event_replay.py`。
+> `tests/test_event_replay.py`（14 个用例，2026-09-05 实测全绿）。
+>
+> **2026-09-05 复核**：状态未变，本方案已实现且测试通过。本轮 7 笔提交未触及事件回放链路，
+> 但 `9506b8a` 的结构化日志让事件链路可按 `trace_id` 串联排查——两者是互补而非重叠。
 > **与设计稿的唯一偏差**：存储后端用 SQLite（`app/api/event_store.py`）而非 Redis Stream——
 > 当前单进程部署引入 Redis 只为存事件不划算。`append`/`read_after` 与 `XADD`/`XREAD`
 > 语义一一对应，P0-2 任务出进程接入 Redis 时只换存储实现类，协议与前端零改动。
@@ -16,12 +19,12 @@ monitor._emit() ──▶ WS.send_json()    发完即丢，无持久化
                               断线期间的最终答案、子智能体结果永久丢失
 ```
 
-| 问题 | 后果 |
-|------|------|
-| 事件不持久化 | 断线期间的事件（含**最终答案**）永久丢失 |
-| 事件无序号 | 前端无法发现"少收了几条" |
-| 重启无回放 | 服务重启后重连的前端拿不到历史事件 |
-| 前端固定 2s 重连 | 无退避，服务抖动时雪崩重连 |
+| 问题         | 后果                     |
+| ---------- | ---------------------- |
+| 事件不持久化     | 断线期间的事件（含**最终答案**）永久丢失 |
+| 事件无序号      | 前端无法发现"少收了几条"          |
+| 重启无回放      | 服务重启后重连的前端拿不到历史事件      |
+| 前端固定 2s 重连 | 无退避，服务抖动时雪崩重连          |
 
 `useDeepAgentSession.ts:154` 固定 `setTimeout(reconnect, 2000)`，无指数退避无抖动。
 
@@ -50,9 +53,11 @@ XADD stream:{user_id}-{thread_id} * \
     ts 2026-08-17T10:00:00
 ```
 
-- `*` 让 Redis 自增生成 ID（形如 `1694256000123-0`）——这就是全局有序的事件序号；
-- `data` 存原 monitor payload 的 JSON；
-- Stream 天然保留历史，配合 `MAXLEN ~ 1000` 或 `XTRIM` 限长防膨胀。
+* `*` 让 Redis 自增生成 ID（形如 `1694256000123-0`）——这就是全局有序的事件序号；
+
+* `data` 存原 monitor payload 的 JSON；
+
+* Stream 天然保留历史，配合 `MAXLEN ~ 1000` 或 `XTRIM` 限长防膨胀。
 
 ## 四、重连协议（差量补发）
 
@@ -68,8 +73,9 @@ WS /ws/{thread_id}?api_key=...&last_seq=1694256000123-0
   3. 然后进入实时订阅模式（BLOCK 读新事件）
 ```
 
-- 前端首次连接无 `last_seq` → 可选：补发最近 N 条 / 或从任务开始补 / 或不补（看产品取舍，默认补最近 100 条）；
-- `last_seq` 不存在（Stream 已被裁剪）→ 降级：补现有全部 + 标记"可能有不完整"。
+* 前端首次连接无 `last_seq` → 可选：补发最近 N 条 / 或从任务开始补 / 或不补（看产品取舍，默认补最近 100 条）；
+
+* `last_seq` 不存在（Stream 已被裁剪）→ 降级：补现有全部 + 标记"可能有不完整"。
 
 ## 五、序号让前端能发现丢件
 
@@ -89,31 +95,34 @@ const delay = Math.min(base * 2 ** attempt, max) + Math.random() * 1000
 setTimeout(reconnect, delay)
 ```
 
-- 2s → 4s → 8s → … 上限 60s，加随机抖动避免雪崩；
-- 重连成功后 `retryCount = 0`。
+* 2s → 4s → 8s → … 上限 60s，加随机抖动避免雪崩；
+
+* 重连成功后 `retryCount = 0`。
 
 ## 七、与 monitor 的对接（最小改动）
 
-| 现有 | 改造后 |
-|------|--------|
-| `monitor._send_to_websocket` 直推本进程 WS | `redis.xadd(stream:{task_key}, ...)`（worker 侧）|
-| API 进程 WS 端点直接收事件 | 启动时 `XREAD BLOCK` 订阅用户相关 stream，推 WS |
-| 无序号 | Stream ID 即序号，payload 带 `seq` |
+| 现有                                    | 改造后                                            |
+| ------------------------------------- | ---------------------------------------------- |
+| `monitor._send_to_websocket` 直推本进程 WS | `redis.xadd(stream:{task_key}, ...)`（worker 侧） |
+| API 进程 WS 端点直接收事件                     | 启动时 `XREAD BLOCK` 订阅用户相关 stream，推 WS           |
+| 无序号                                   | Stream ID 即序号，payload 带 `seq`                  |
 
 **关键**：`monitor` 的公开方法（`report_tool`/`report_task_result`/...）签名不变，只改 `_emit` 内部从"推 WS"变成"写 Stream"。业务工具零改动。
 
 ## 八、与 P0-2 合并的协同
 
 P0-2 任务队列用 Redis 做 ARQ 队列；本方案用 Redis Stream 做事件。**同一个 Redis 实例**：
-- `queue:arq` 队列（任务）
-- `stream:{task_key}`（事件）
+
+* `queue:arq` 队列（任务）
+
+* `stream:{task_key}`（事件）
 
 两者共用连接池、共用运维。建议 P0-2 阶段 2 直接做 P0-3，省一次 Redis 接入。
 
 ## 九、迁移步骤
 
 1. **事件落 Stream（1 天）**：`monitor._emit` 改 `redis.xadd`；保留 console print 兜底；API 进程订阅推 WS。
-2. **重连带 last_seq 补发（0.5 天）**：WS 握手收 `last_seq`，`XREAD` 差量先补。
+2. **重连带 last\_seq 补发（0.5 天）**：WS 握手收 `last_seq`，`XREAD` 差量先补。
 3. **前端退避（0.5 天）**：`useDeepAgentSession.ts` 改指数退避。
 4. **裁剪策略（0.5 天）**：`XADD ... MAXLEN ~ 1000` 防膨胀；任务结束保留 30 分钟后删除 Stream。
 
@@ -121,12 +130,12 @@ P0-2 任务队列用 Redis 做 ARQ 队列；本方案用 Redis Stream 做事件�
 
 ## 十、风险与取舍
 
-| 风险 | 缓解 |
-|------|------|
-| Redis 挂了事件全丢 | Redis 持久化（AOF）+ 事件丢失时前端可降级重试整个任务查询 |
-| Stream 膨胀 | `MAXLEN` 限长 + 任务结束 TTL 删除 |
-| 补发顺序与实时事件交错 | 补发完成后才进入实时订阅，串行化避免乱序 |
-| last_seq 跨任务混淆 | Stream 按 task_key 隔离，序号只在单 Stream 内有意义 |
+| 风险              | 缓解                                      |
+| --------------- | --------------------------------------- |
+| Redis 挂了事件全丢    | Redis 持久化（AOF）+ 事件丢失时前端可降级重试整个任务查询      |
+| Stream 膨胀       | `MAXLEN` 限长 + 任务结束 TTL 删除               |
+| 补发顺序与实时事件交错     | 补发完成后才进入实时订阅，串行化避免乱序                    |
+| last\_seq 跨任务混淆 | Stream 按 task\_key 隔离，序号只在单 Stream 内有意义 |
 
 ## 十一、面试讲法
 
@@ -134,5 +143,7 @@ P0-2 任务队列用 Redis 做 ARQ 队列；本方案用 Redis Stream 做事件�
 
 ## 十二、工作量估计
 
-- 独立做：2-3 天
-- 与 P0-2 合并做：边际约 1 天（Redis 已接入）
+* 独立做：2-3 天
+
+* 与 P0-2 合并做：边际约 1 天（Redis 已接入）
+

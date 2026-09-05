@@ -28,12 +28,14 @@ import asyncio
 import json
 import sys
 import traceback
+import uuid
 from datetime import datetime
 from pathlib import Path
 
 from app.api import monitor as monitor_mod
+from app.api.event_store import event_store
 from app.api.monitor import monitor
-from app.agent.main_agent import run_deep_agent
+from app.agent.main_agent import close_main_agent, run_deep_agent
 
 from eval.cases import CASES, EvalCase
 from eval.judge import judge_routing, judge_sql, judge_with_llm
@@ -82,34 +84,63 @@ def _capture_for_case() -> dict:
 # 单个用例执行
 # ---------------------------------------------------------------------------
 
-async def run_one(case: EvalCase, timeout: float = 180.0) -> dict:
-    """跑一个用例，返回执行结果（含捕获到的工具/结果与判分）"""
-    box, restore = _capture_for_case()
-    thread_id = f"eval-{case.id}"
-    started = datetime.now().isoformat()
+async def run_one(
+    case: EvalCase,
+    timeout: float = 180.0,
+    rate_limit_wait: float = 70.0,
+    max_retries: int = 3,
+) -> dict:
+    """跑一个用例，返回执行结果（含捕获到的工具/结果与判分）
 
-    try:
-        await asyncio.wait_for(
-            run_deep_agent(case.query, thread_id, user_id="eval"),
-            timeout=timeout,
-        )
-    except asyncio.TimeoutError:
-        box["errors"].append(f"超时（{timeout}s）")
-    except Exception as e:
-        box["errors"].append(f"执行异常: {e}\n{traceback.format_exc()}")
-    finally:
-        restore()
+    限流退避：用例错误里含 429（TPM 超限）时等待 rate_limit_wait 秒再整体重试。
+    被拒请求也占限流窗口，SDK 内置的秒级快速重试只会自我续满窗口，
+    必须长等待让整个滑动窗口排空后再试。
+    每次尝试使用全新 thread_id：checkpoint 记忆不跨尝试/跨轮次泄漏
+    （warm-start 会让模型凭会话记忆直接作答、不再调用工具，污染基线）。
+    """
+    run: dict = {}
+    for attempt in range(max_retries + 1):
+        box, restore = _capture_for_case()
+        thread_id = f"eval-{case.id}-{uuid.uuid4().hex[:8]}"
+        started = datetime.now().isoformat()
 
-    return {
-        "id": case.id,
-        "category": case.category,
-        "query": case.query,
-        "started_at": started,
-        "result": box["result"],
-        "tools": box["tools"],
-        "assistants": box["assistants"],
-        "errors": box["errors"],
-    }
+        tokens_used = 0
+        try:
+            tokens_used = await asyncio.wait_for(
+                run_deep_agent(case.query, thread_id, user_id="eval"),
+                timeout=timeout,
+            ) or 0
+        except asyncio.TimeoutError:
+            box["errors"].append(f"超时（{timeout}s）")
+        except Exception as e:
+            box["errors"].append(f"执行异常: {e}\n{traceback.format_exc()}")
+        finally:
+            restore()
+
+        run = {
+            "id": case.id,
+            "category": case.category,
+            "query": case.query,
+            "started_at": started,
+            "result": box["result"],
+            "tools": box["tools"],
+            "assistants": box["assistants"],
+            "errors": box["errors"],
+            # 主智能体+子智能体全部模型调用的 token 总量（judge 判分开销不在内）
+            "tokens_used": int(tokens_used),
+        }
+
+        if any("429" in e for e in box["errors"]) and attempt < max_retries:
+            print(
+                f"    ... TPM 限流，等待 {rate_limit_wait:.0f}s 后重试"
+                f"（第 {attempt + 1}/{max_retries} 次）",
+                flush=True,
+            )
+            await asyncio.sleep(rate_limit_wait)
+            continue
+        break
+
+    return run
 
 
 # ---------------------------------------------------------------------------
@@ -133,6 +164,17 @@ def score_one(case: EvalCase, run: dict) -> dict:
 # ---------------------------------------------------------------------------
 
 async def main_async(args) -> int:
+    try:
+        return await _run_all(args)
+    finally:
+        # 脚本进程退出前释放两条 aiosqlite 连接（checkpointer + 事件库）：
+        # aiosqlite worker 是非 daemon 线程，不关闭会让 threading._shutdown
+        # 永久 join，进程即使主流程结束也挂住不退（实测踩中）
+        await close_main_agent()
+        await event_store.close()
+
+
+async def _run_all(args) -> int:
     cases = select_cases(args)
     if not cases:
         print("没有匹配的用例", file=sys.stderr)
@@ -149,7 +191,12 @@ async def main_async(args) -> int:
 
     for i, case in enumerate(cases, 1):
         print(f"[{i}/{len(cases)}] {case.id} ({case.category}) ...", flush=True)
-        run = await run_one(case, timeout=args.timeout)
+        run = await run_one(
+            case,
+            timeout=args.timeout,
+            rate_limit_wait=args.rate_limit_wait,
+            max_retries=args.retries,
+        )
 
         # LLM-as-judge 类支持多次取均值
         if case.category in ("web", "multi") and args.runs > 1:
@@ -171,12 +218,22 @@ async def main_async(args) -> int:
             passed += 1
         status = "PASS" if verdict["pass"] else "FAIL"
         print(f"    -> {status}  score={verdict['score']}"
+              f"  tokens={run['tokens_used']}"
               f"  tools={run['tools']}  assistants={run['assistants']}")
         if run["errors"]:
             print(f"    errors: {run['errors']}")
 
+        # 用例间限速：每条用例瞬时消耗 1.6-2.5 万 token，会顶到账户 TPM
+        # 上限（L0 等级 2-8 万/模型），连续背靠背必触发 429
+        if i < len(cases) and args.pause > 0:
+            await asyncio.sleep(args.pause)
+
     report["passed"] = passed
     report["pass_rate"] = round(passed / len(cases), 3)
+
+    # token 消耗汇总（成本核算用；单价按 .env 实际模型计，judge 开销未计入）
+    report["total_tokens"] = sum(c.get("tokens_used", 0) for c in report["cases"])
+    print(f"\n总 token 消耗（agent 侧）：{report['total_tokens']}")
 
     print(f"\n{'='*50}")
     print(f"通过 {passed}/{len(cases)}（{report['pass_rate']*100:.1f}%）")
@@ -216,6 +273,12 @@ def main():
                    help="LLM-as-judge 重复次数（取均值），默认 1")
     p.add_argument("--timeout", type=float, default=180.0,
                    help="单用例超时秒数，默认 180")
+    p.add_argument("--pause", type=float, default=5.0,
+                   help="用例间隔秒数（限速防 429），默认 5")
+    p.add_argument("--retries", type=int, default=3,
+                   help="429 限流时单条用例最大重试次数，默认 3")
+    p.add_argument("--rate-limit-wait", type=float, default=70.0,
+                   help="429 退避等待秒数（需大于一个限流窗口），默认 70")
     p.add_argument("--out", help="JSON 报告输出路径")
     args = p.parse_args()
     sys.exit(asyncio.run(main_async(args)))

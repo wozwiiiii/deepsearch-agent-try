@@ -1,6 +1,10 @@
 # deepsearch-agents Code Wiki
 
-> 生成基准：`production-hardening` 分支（2026-08-30，HEAD `2a0db27`），154 个测试全绿。
+> **生成基准（2026-09-05 更新）**：`main` 分支，HEAD `4aebb83`，154 个测试全绿（实测 28.80 秒）。
+>
+> **⚠️ 分支表述更正**：本文件此前版本写"生成基准 `production-hardening` 分支（2026-08-30，HEAD `2a0db27`）"——**该分支不存在**（`git branch -a` 仅 `main`）。全部增量均在 `main` 上，**查看增量请用 `git diff df6d52e..HEAD`**（`df6d52e` 为上游 didilili 最后一笔，2026-05-18），`git diff main` 恒为空。
+>
+> 规模实测：后端 `app/` 28 个 `.py` / 3,351 行；`tests/` 154 用例；`eval/` 45 条；`frontend/src/` 19 文件 / 2,140 行。
 > 本文档面向需要快速理解代码结构的开发者与评审者。改造动机的"原问题→修复→验证"明细见 [PRODUCTION_NOTES.md](PRODUCTION_NOTES.md)；本文聚焦**现状结构 + 设计决策的为什么**，所有代码片段摘自当前分支真实文件。
 
 ---
@@ -28,7 +32,12 @@
 
 **定位**：多智能体深度研究系统（Deep Research Agent）。用户提交研究任务，主智能体调度三个专职子智能体从四种数据源（公网 Tavily / MySQL / RAGFlow 知识库 / 上传文件）检索，产出 Markdown/PDF 报告，全过程经 WebSocket 实时推送前端。
 
-**与上游的关系（必须如实）**：底座是开源教学项目 [didilili/deepsearch-agents](https://github.com/didilili/deepsearch-agents)（MIT，对应教程"深度研搜"实战）。`main` 分支与上游对齐；本仓库全部增量在 `production-hardening` 分支——四批生产化改造 + 两次代码审查修复，核心是**安全加固、认证/多租户、限流/成本、事件回放**，`git diff main` 可逐文件核对。
+**与上游的关系（必须如实）**：底座是开源教学项目 [didilili/deepsearch-agents](https://github.com/didilili/deepsearch-agents)（MIT，对应教程"深度研搜"实战）。
+
+- **上游基线**：`df6d52e`（作者 didilili，2026-05-18）；此前 20 笔提交均非本人所作。
+- **本人增量**：18 笔提交（`d0f6eed` → `4aebb83`），**53 文件 / +6193 −546 行**，全部在 `main` 分支上线性累积。
+- **查看增量的正确命令**：`git diff df6d52e..HEAD`。⚠️ 本文件旧版写的"`git diff main` 可逐文件核对"**已失效**——增量已在 main 上，该命令输出为空。
+- 核心内容：安全加固、认证/多租户、限流/成本、事件回放，以及后续增量（提示词矛盾修复、同步 I/O 超时重试、结构化日志、评测集扩量、CI 结构自检）。
 
 **技术栈**：
 
@@ -406,7 +415,7 @@ deepsearch-agents/
 │   └── utils/                  # path_utils（收容校验）/ word_converter
 ├── frontend/                   # React（见 §9）
 ├── tests/                      # 154 个测试（见 §13）
-├── eval/                       # 评测集 cases/judge/runner（20 用例）
+├── eval/                       # 评测集 cases/judge/runner（45 条，2026-09-05 自 20 条扩量）
 ├── docker/                     # MySQL 8.4 compose + 初始化 SQL + 只读账号脚本
 ├── examples/                   # DeepAgents 框架 15 个教学脚本（非运行时依赖）
 ├── docs/                       # PRODUCTION_NOTES / 设计稿 / WORK_STATUS / 本 Wiki
@@ -586,7 +595,7 @@ seq 处理三规则见 §3.5。**重连退避**：resync pending → 立即重�
 
 ```
 eval/
-├── cases.py   # 20 用例：sql 12（确定性子串判分）/ routing 2 / web 4 / multi 2（LLM-as-judge）
+├── cases.py   # 45 条用例（`66f85e9` 自 20 条扩量）：sql 22（确定性子串判分）/ routing 6 / web 10 / multi 7（LLM-as-judge）
 ├── judge.py   # judge_sql（子串包含）/ judge_routing（工具命中）/ judge_with_llm（1-5 分）
 └── runner.py  # 直接调 run_deep_agent（不启 HTTP），monkeypatch monitor.report_* 捕获结果
 ```
@@ -678,23 +687,39 @@ python -m eval.runner                # 评测（需真实服务与密钥）
 
 ### 14.1 已具备（单机可上线口径）
 
-认证（fail-closed）+ 多租户复合键隔离 + 路径收容 + SQL 三层防护 + 上传四重校验 + 限流 + 三重成本护栏（次数/token/超时）+ 会话状态持久化 + 事件回放（seq + 差量补发）+ 短时令牌（密钥不进 URL）+ 154 回归测试 + 20 条评测集最小版。
+认证（fail-closed）+ 多租户复合键隔离 + 路径收容 + SQL 三层防护 + 上传四重校验 + 限流 + 三重成本护栏（次数/token/超时）+ 会话状态持久化 + 事件回放（seq + 差量补发）+ 短时令牌（密钥不进 URL）+ 同步 I/O 超时与重试（防线程池耗尽）+ 结构化日志与 trace_id 贯穿 + 154 回归测试 + 45 条评测集。
 
-### 14.2 已知边界（如实）
+### 14.2 已知边界（2026-09-05 如实更新）
 
 | 项 | 状态 |
 |----|------|
-| **任务在进程内**（唯一 P0） | `asyncio.create_task` 重启即丢、无法多副本；方案见 TASK_QUEUE_DESIGN.md（ARQ + Redis + Postgres） |
+| **任务在进程内**（唯一剩余 P0） | `asyncio.create_task`（`server.py:348`）重启即丢、无法多副本；方案见 TASK_QUEUE_DESIGN.md（ARQ + Redis + Postgres）。**至今一行未动** |
 | 事件库/令牌表进程内 | 接口已对齐 Redis Stream 语义，随 P0-2 外置 |
-| 工具无网络重试 | Tavily/RAGFlow 失败直接把异常文本交给模型 |
-| 同步工具疑似阻塞 | mysql-connector/Tavily 均同步 @tool，LangChain 理论上丢线程池，**未压测验证** |
-| 评测集 20 条 | 最小版已建，待扩 50 条接 CI |
-| 无结构化日志/指标 | 全部 print（P2）；提示词自相矛盾（§3.8） |
+| **评测基线从未跑过** | 45 条已建、CI 结构自检已接，但**无 `.env`（缺 Key）与 MySQL 容器，未产出任何跑分**。这是当前最大的证据缺口 |
+| MySQL 查询阶段无超时 | `connection_timeout=10` 仅约束建连；查询阶段 mysql-connector-python 无可靠支持，属驱动限制 |
+| 会话级（跨任务累计）token 预算未做 | run 级已完成 |
+| OTel / 指标采集未做 | 结构化日志是其前置，已就位 |
+| 事件库无 TTL 清理 | 当前只有条数裁剪（每 task_key 保留最近 1000 条） |
+| 后端无 Dockerfile | 全项目 `find -iname 'Dockerfile*'` 为空，无法容器化部署 |
 
-### 14.3 提交脉络（production-hardening，`git diff main` 为准）
+**本轮已消除的旧边界**（旧版 14.2 曾列出，现予删除并说明）：
+
+| 原边界 | 处理结果 |
+|--------|----------|
+| ~~工具无网络重试~~ | ✅ `c0b5b45`：Tavily `timeout=20`、MySQL `connection_timeout=10`、LLM `max_retries=2` |
+| ~~同步工具疑似阻塞（未压测验证）~~ | ✅ **实测证伪**（`c0b5b45`）：40 个阻塞任务并发下 `/health` 仍 0.0000s 返回，`run_in_executor` 不阻塞事件循环；真问题是 `wait_for` 杀不掉线程导致线程池耗尽，已按此修复 |
+| ~~全部 print，无结构化日志~~ | ✅ `9506b8a`：JsonFormatter + trace_id 贯穿；生产路径 print 清零（残留 12 处经逐行核对全在 `__main__` 演示块内） |
+| ~~提示词自相矛盾~~ | ✅ `c11fd2b`：主智能体提示词与真实工具列表对齐；`b1d7774` 修"你你"笔误 |
+| ~~评测集 20 条待扩 50 条接 CI~~ | ✅ `66f85e9` 扩到 45 条；`3e91737` CI 接入结构自检（**非全量评测**，不调真实 Agent） |
+
+### 14.3 提交脉络（`main` 分支，`git diff df6d52e..HEAD` 为准）
+
+> ⚠️ 旧版标题写"（production-hardening，`git diff main` 为准）"——该分支不存在且该命令恒为空，已更正。
 
 | 提交 | 内容 |
 |------|------|
+| `df6d52e` | **上游基线**（didilili，2026-05-18），此前 20 笔均非本人所作 |
+| `d0f6eed` | 修正错误的文件夹命名 |
 | `70f3162` | 第一批：安全加固（路径/SQL/上传/越权/CORS） |
 | `d2bc74e` | 第二批：认证 + 多租户 + SQLite checkpointer |
 | `62f13ab` | 第三批：限流 + fail-closed + 调用上限 + 审查修复 4 项 |
@@ -703,6 +728,16 @@ python -m eval.runner                # 评测（需真实服务与密钥）
 | `6b4a5dc` | 第四批：事件回放 + 硬超时 + 审查修复 3 项 |
 | `f741fb6` | 单任务 token 预算熔断 |
 | `2a0db27` | 短时链接令牌 |
+| `64c8aa9` / `4d41d02` / `f4f1995` | CODE_WIKI 文档、README 更新、CI 处理 |
+| `c11fd2b` | 提示词矛盾修复（与真实工具对齐） |
+| `c0b5b45` | 同步 I/O 与 LLM 调用超时/重试，防线程池耗尽 |
+| `9506b8a` | 结构化日志 + trace_id 贯穿 |
+| `66f85e9` | 评测集 20 → 45 条 |
+| `b1d7774` | 提示词"你你"笔误 |
+| `3e91737` | CI 接入评测结构自检 + 重复 id 断言 |
+| `4aebb83` | 设计文档格式化 |
+
+**本人增量合计 18 笔，53 文件 / +6193 −546**（`git diff --shortstat df6d52e..HEAD`）。其中后 7 笔（`c11fd2b`→`4aebb83`，17 文件 / +531 −116）**已提交但尚未推送远端**。
 
 ---
 
@@ -721,4 +756,4 @@ python -m eval.runner                # 评测（需真实服务与密钥）
 
 ---
 
-*本文档与代码同步维护：结构性改动（新模块/接口变更/常量调整）后需更新对应章节；数字口径以 `git diff main` 与 pytest 实测为准。*
+*本文档与代码同步维护：结构性改动（新模块/接口变更/常量调整）后需更新对应章节；数字口径以 `git diff df6d52e..HEAD` 与 pytest 实测为准（**不是** `git diff main`——增量已在 main 上，该命令恒为空）。*

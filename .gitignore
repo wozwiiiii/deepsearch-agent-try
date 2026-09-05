@@ -66,3 +66,9 @@ testem.log
 # System Files
 .DS_Store
 Thumbs.db
+
+# eval report local backups (rejudge.py writes *.json.bak before first in-place edit)
+*.bak
+
+# git 修复期证据备份（对象库损毁后的 reflog/config 存档）
+git-rescue-20260905/

@@ -1,0 +1,33 @@
+{
+  "generated_at": "2026-09-05T13:35:42.009426",
+  "total": 1,
+  "cases": [
+    {
+      "id": "sql-01-brand-name",
+      "category": "sql",
+      "query": "数据库里布洛芬缓释胶囊的商品名是什么？",
+      "started_at": "2026-09-05T13:35:42.009426",
+      "result": "数据库中布洛芬缓释胶囊的商品名为“芬必得”。 如果您需要更多关于布洛芬缓释胶囊的信息，我还可以为您提供。",
+      "tools": [
+        "数据库表名查询工具：list_sql_tables",
+        "数据库表数据查询工具：get_table_data"
+      ],
+      "assistants": [
+        "数据库查询助手"
+      ],
+      "errors": [],
+      "verdict": {
+        "pass": true,
+        "score": 1.0,
+        "detail": {
+          "matched": [
+            "芬必得"
+          ],
+          "missing": []
+        }
+      }
+    }
+  ],
+  "passed": 1,
+  "pass_rate": 1.0
+}

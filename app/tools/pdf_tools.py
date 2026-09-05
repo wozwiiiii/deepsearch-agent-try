@@ -5,7 +5,6 @@ Markdown 转 PDF 工具
 会话目录中的输入/输出路径，真正的版式转换交给 app.utils.word_converter。
 """
 
-import logging
 from pathlib import Path
 
 try:
@@ -17,8 +16,11 @@ from langchain_core.tools import tool
 
 from app.api.context import get_session_context
 from app.api.monitor import monitor
+from app.utils.logging_setup import get_logger
 from app.utils.path_utils import PathEscapeError, resolve_path
 from app.utils.word_converter import convert_md_to_pdf as convert_md_to_pdf_via_word
+
+logger = get_logger(__name__)
 
 
 @tool
@@ -63,7 +65,7 @@ def convert_md_to_pdf(
         return convert_md_to_pdf_via_word(md_abs_path, pdf_abs_path)
 
     except Exception as e:
-        logging.error(f"转换失败: {e}", exc_info=True)
+        logger.error(f"转换失败: {e}", exc_info=True)
         return f"转换失败: {str(e)}"
 
 

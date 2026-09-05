@@ -19,6 +19,9 @@ from fastapi import WebSocket
 
 from app.api.context import get_thread_context
 from app.api.event_store import event_store
+from app.utils.logging_setup import get_logger
+
+logger = get_logger(__name__)
 
 
 class ToolMonitor:
@@ -91,7 +94,7 @@ class ToolMonitor:
                 pass
 
         # 控制台保底输出，便于无前端场景下观察执行过程
-        print(f"\n[Monitor:{event_type}] {message}")
+        logger.info(f"[Monitor:{event_type}] {message}")
 
     def _schedule_persist_and_send(
         self,
@@ -135,13 +138,13 @@ class ToolMonitor:
             )
             payload["seq"] = seq
         except Exception as e:
-            print(f"[Monitor] 事件持久化失败（该事件将不可回放）: {e}")
+            logger.warning(f"[Monitor] 事件持久化失败（该事件将不可回放）: {e}")
 
         if self.websocket_manager:
             try:
                 await self.websocket_manager.send_to_thread(payload, thread_id)
             except Exception as e:
-                print(f"[Monitor] WebSocket send failed: {e}")
+                logger.error(f"[Monitor] WebSocket send failed: {e}", exc_info=True)
 
     def report_tool(
         self,
@@ -203,7 +206,7 @@ class ConnectionManager:
         """绑定 FastAPI 主事件循环，并同步注册到 monitor"""
         self.loop = loop
         monitor.set_websocket_manager(self)
-        print(f"[Monitor] ConnectionManager manually bound to loop: {id(self.loop)}")
+        logger.info(f"[Monitor] ConnectionManager manually bound to loop: {id(self.loop)}")
 
     def register(self, websocket: WebSocket, thread_id: str) -> None:
         """
@@ -213,15 +216,15 @@ class ConnectionManager:
         推送，否则补发期间新事件会与历史事件交错下发，破坏 seq 顺序。
         """
         self.active_connections[thread_id] = websocket
-        print(f"Client connected: {thread_id}")
+        logger.info(f"Client connected: {thread_id}")
 
     def disconnect(self, websocket: WebSocket, thread_id: str) -> None:
         """移除已经断开的 WebSocket 连接"""
         if self.active_connections.get(thread_id) is websocket:
             del self.active_connections[thread_id]
-            print(f"Client disconnected: {thread_id}")
+            logger.info(f"Client disconnected: {thread_id}")
         else:
-            print(f"Stale websocket disconnected, current connection kept: {thread_id}")
+            logger.info(f"Stale websocket disconnected, current connection kept: {thread_id}")
 
     async def send_personal_message(self, message: str, websocket: WebSocket) -> None:
         """向指定 WebSocket 发送纯文本消息"""

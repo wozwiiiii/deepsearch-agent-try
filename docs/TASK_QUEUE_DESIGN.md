@@ -1,6 +1,11 @@
 # P0-2 任务队列与并发治理设计方案
 
 > 状态：**设计稿**（未实现）。当前最高优先级的上线阻塞项。
+>
+> **2026-09-05 复核**：状态未变，**实现仍是一行未动**——代码中仍是 `asyncio.create_task`（`server.py:348`）跑在 Web 进程内。本设计稿的三阶段划分（会话亲和 → 状态出进程 → 事件广播）与选型论证（ARQ 基于 Redis、原生 async，Celery 同步模型会让 async Agent 退化）经复核**依然成立，无需修改**。
+>
+> **阻塞条件**：需本地起 Redis（+ Postgres）。这不是设计问题，是执行资源问题。
+> **优先级提示**：若目标是求职而非上线，跑评测基线（`WORK_STATUS.md` 第六节）的性价比高于本项——本项投入 4–6 天只能证明"工程能力"，而基线能证明"效果"，后者目前为零。
 > 目标：把"任务全在 API 进程内"改成"任务状态外置 + 执行出进程 + 事件广播"，支撑多副本水平扩容。
 
 ## 一、当前架构为什么不能多副本
@@ -20,11 +25,11 @@
 └─────────────────────────────────────────────────────┘
 ```
 
-| 组件 | 多副本下的问题 |
-|------|----------------|
-| `active_tasks`（进程内 dict） | 取消请求打到没该任务的 worker → 404 |
-| WS 连接粘单进程 | 任务在 worker A 执行，事件只能推到 A 的 WS；连到 worker B 的前端收不到 |
-| `AsyncSqliteSaver` 单文件 | 多进程并发写同一 SQLite → 库级写锁冲突 |
+| 组件                       | 多副本下的问题                                          |
+| ------------------------ | ------------------------------------------------ |
+| `active_tasks`（进程内 dict） | 取消请求打到没该任务的 worker → 404                         |
+| WS 连接粘单进程                | 任务在 worker A 执行，事件只能推到 A 的 WS；连到 worker B 的前端收不到 |
+| `AsyncSqliteSaver` 单文件   | 多进程并发写同一 SQLite → 库级写锁冲突                         |
 
 ## 二、目标架构
 
@@ -53,7 +58,7 @@
                 └─────────────┘
 ```
 
-**关键不变量**：HTTP 接口签名不变，只换实现；复合键 `{user_id}-{thread_id}` 仍是 task 表主键、WS 路由键、checkpointer thread_id。
+**关键不变量**：HTTP 接口签名不变，只换实现；复合键 `{user_id}-{thread_id}` 仍是 task 表主键、WS 路由键、checkpointer thread\_id。
 
 ## 三、任务表 schema（Postgres）
 
@@ -76,67 +81,84 @@ CREATE INDEX idx_tasks_status ON tasks(status);
 CREATE INDEX idx_tasks_user ON tasks(user_id);
 ```
 
-- 取消接口不再查 `active_tasks` dict，而是 `UPDATE tasks SET status='cancelled' WHERE task_key=...`；worker 轮询状态发现 cancelled 后中止。
-- 重启不丢任务：`pending`/`running` 的任务由 worker 启动时重拾（`running` 重新入队，幂等由 task_key 保证）。
+* 取消接口不再查 `active_tasks` dict，而是 `UPDATE tasks SET status='cancelled' WHERE task_key=...`；worker 轮询状态发现 cancelled 后中止。
+
+* 重启不丢任务：`pending`/`running` 的任务由 worker 启动时重拾（`running` 重新入队，幂等由 task\_key 保证）。
 
 ## 四、队列选型：ARQ（推荐）
 
-| 方案 | 优点 | 缺点 | 适配度 |
-|------|------|------|--------|
-| **ARQ** | 纯 async、基于 Redis、轻量、与 FastAPI 同事件循环模型 | 功能比 Celery 少 | ★★★★★ |
-| Celery | 成熟、生态大 | 同步模型，与 async Agent 混用要起独立进程+线程池，复杂 | ★★★ |
-| Temporal | 工作流引擎、可观测强 | 引入整套 Temporal server，过重 | ★★ |
+| 方案       | 优点                                    | 缺点                                 | 适配度   |
+| -------- | ------------------------------------- | ---------------------------------- | ----- |
+| **ARQ**  | 纯 async、基于 Redis、轻量、与 FastAPI 同事件循环模型 | 功能比 Celery 少                       | ★★★★★ |
+| Celery   | 成熟、生态大                                | 同步模型，与 async Agent 混用要起独立进程+线程池，复杂 | ★★★   |
+| Temporal | 工作流引擎、可观测强                            | 引入整套 Temporal server，过重            | ★★    |
 
 **推荐 ARQ**：本项目 Agent 是 async（`run_deep_agent` 是协程），ARQ 原生 async、只需 Redis、worker 与 API 同样是 asyncio。Celery 的同步模型会让 async Agent 退化成线程池调用，丢掉并发优势。
 
 ## 五、与现有代码的接口对齐（最小改动点）
 
-| 现有 | 改造后 | 改动位置 |
-|------|--------|----------|
-| `active_tasks: dict` | 删掉，改查 `tasks` 表 | `server.py` |
-| `asyncio.create_task(run_deep_agent)` | `await pool.enqueue_job('run_task', query, task_key)` | `server.py::run_task` |
-| `cancel_task` 查 dict + `task.cancel()` | `UPDATE tasks SET status='cancelled'`，worker 轮询中止 | `server.py` + worker |
-| `AsyncSqliteSaver` | `langgraph-checkpoint-postgres` 的 `AsyncPostgresSaver` | `main_agent.py::_get_agent`（接口不变，换 saver 实现） |
-| `monitor._send_to_websocket` 直推本进程 WS | `redis.publish(channel, payload)`；API 进程订阅 channel 再推 WS | `monitor.py` |
+| 现有                                     | 改造后                                                      | 改动位置                                         |
+| -------------------------------------- | -------------------------------------------------------- | -------------------------------------------- |
+| `active_tasks: dict`                   | 删掉，改查 `tasks` 表                                          | `server.py`                                  |
+| `asyncio.create_task(run_deep_agent)`  | `await pool.enqueue_job('run_task', query, task_key)`    | `server.py::run_task`                        |
+| `cancel_task` 查 dict + `task.cancel()` | `UPDATE tasks SET status='cancelled'`，worker 轮询中止        | `server.py` + worker                         |
+| `AsyncSqliteSaver`                     | `langgraph-checkpoint-postgres` 的 `AsyncPostgresSaver`   | `main_agent.py::_get_agent`（接口不变，换 saver 实现） |
+| `monitor._send_to_websocket` 直推本进程 WS  | `redis.publish(channel, payload)`；API 进程订阅 channel 再推 WS | `monitor.py`                                 |
 
-**复合键不动**：`composite_task_key`、`validate_thread_id`、user_id 字符集约束全部保留——这是多租户隔离的根，改它等于推倒重来。
+**复合键不动**：`composite_task_key`、`validate_thread_id`、user\_id 字符集约束全部保留——这是多租户隔离的根，改它等于推倒重来。
 
 ## 六、迁移步骤（阶梯式，可灰度）
 
 ### 阶段 0：会话亲和过渡（1 天，上线最小可用）
-- 负载均衡做 sticky session（按 `X-API-Key` 或 `thread_id` 哈希固定到某 worker）；
-- 保持单进程语义，`active_tasks`/SQLite 仍可用；
-- **价值**：先能多副本跑起来抗故障，不解决并发写问题。
-- **风险**：单 worker 挂了它上面的任务全丢（可接受过渡期风险）。
+
+* 负载均衡做 sticky session（按 `X-API-Key` 或 `thread_id` 哈希固定到某 worker）；
+
+* 保持单进程语义，`active_tasks`/SQLite 仍可用；
+
+* **价值**：先能多副本跑起来抗故障，不解决并发写问题。
+
+* **风险**：单 worker 挂了它上面的任务全丢（可接受过渡期风险）。
 
 ### 阶段 1：任务状态出进程（2-3 天）
-- 建 Postgres + task 表；
-- `run_task` 改为写 task 表 + 入 ARQ 队列；新增 `worker.py` 跑 ARQ worker 调 `run_deep_agent`；
-- `cancel_task` 改为更新 task 表状态；
-- checkpointer 换 `AsyncPostgresSaver`。
-- **价值**：任务持久、取消跨副本生效、checkpointer 多副本安全。
+
+* 建 Postgres + task 表；
+
+* `run_task` 改为写 task 表 + 入 ARQ 队列；新增 `worker.py` 跑 ARQ worker 调 `run_deep_agent`；
+
+* `cancel_task` 改为更新 task 表状态；
+
+* checkpointer 换 `AsyncPostgresSaver`。
+
+* **价值**：任务持久、取消跨副本生效、checkpointer 多副本安全。
 
 ### 阶段 2：事件广播（1-2 天）
-- `monitor` 的事件改 publish 到 Redis `channel:{task_key}`；
-- API 进程启动时订阅用户相关 channel，收到事件推 WS；
-- 与 P0-3 事件回放天然合并（事件落 Redis Stream 既能广播又能回放，见 EVENT_REPLAY_DESIGN.md）。
+
+* `monitor` 的事件改 publish 到 Redis `channel:{task_key}`；
+
+* API 进程启动时订阅用户相关 channel，收到事件推 WS；
+
+* 与 P0-3 事件回放天然合并（事件落 Redis Stream 既能广播又能回放，见 EVENT\_REPLAY\_DESIGN.md）。
 
 ## 七、风险与取舍
 
-| 风险 | 说明 | 缓解 |
-|------|------|------|
-| Postgres 引入运维成本 | 要起 DB、备份 | 单机可先用 Docker；上线用云托管 |
-| ARQ worker 单点 | worker 挂任务卡 running | 启动时扫 running 任务重入队 + 心跳超时回收 |
-| 取消延迟 | 不再是即时 `task.cancel()`，要等 worker 轮询 | worker 每 1-2s 检查 task 状态；取消返回 `cancelling` 而非 `cancelled`（与现有 `cancelling` 状态一致） |
-| 复合键碰撞 | 极低概率 | user_id 字符集约束已保证无歧义 |
+| 风险              | 说明                                 | 缓解                                                                               |
+| --------------- | ---------------------------------- | -------------------------------------------------------------------------------- |
+| Postgres 引入运维成本 | 要起 DB、备份                           | 单机可先用 Docker；上线用云托管                                                              |
+| ARQ worker 单点   | worker 挂任务卡 running                | 启动时扫 running 任务重入队 + 心跳超时回收                                                      |
+| 取消延迟            | 不再是即时 `task.cancel()`，要等 worker 轮询 | worker 每 1-2s 检查 task 状态；取消返回 `cancelling` 而非 `cancelled`（与现有 `cancelling` 状态一致） |
+| 复合键碰撞           | 极低概率                               | user\_id 字符集约束已保证无歧义                                                             |
 
 ## 八、面试讲法
 
-> "我把任务从进程内 asyncio.create_task 改成 ARQ 队列 + Postgres task 表 + Redis pub/sub：HTTP 进程无状态可水平扩容，worker 独立进程跑 Agent，事件经 Redis 广播给持有 WS 的 API 进程。checkpointer 从 SQLite 换 Postgres（接口不变，当初选可替换 saver 的回报）。复合键 `{user}-{thread}` 全程不动——它是多租户隔离的根。迁移分三阶段：会话亲和过渡 → 状态出进程 → 事件广播，每阶段都能独立上线。"
+> "我把任务从进程内 asyncio.create\_task 改成 ARQ 队列 + Postgres task 表 + Redis pub/sub：HTTP 进程无状态可水平扩容，worker 独立进程跑 Agent，事件经 Redis 广播给持有 WS 的 API 进程。checkpointer 从 SQLite 换 Postgres（接口不变，当初选可替换 saver 的回报）。复合键 `{user}-{thread}` 全程不动——它是多租户隔离的根。迁移分三阶段：会话亲和过渡 → 状态出进程 → 事件广播，每阶段都能独立上线。"
 
 ## 九、工作量估计
 
-- 阶段 0：1 天
-- 阶段 1：2-3 天
-- 阶段 2：1-2 天（与 P0-3 合并做更划算）
-- **合计 4-6 天**（含测试）
+* 阶段 0：1 天
+
+* 阶段 1：2-3 天
+
+* 阶段 2：1-2 天（与 P0-3 合并做更划算）
+
+* **合计 4-6 天**（含测试）
+

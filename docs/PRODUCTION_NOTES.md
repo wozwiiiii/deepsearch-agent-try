@@ -197,17 +197,27 @@ cd frontend && pnpm install && pnpm exec tsc -b
 
 以下按「上线阻塞性」排序，是诚实的能力边界，也是后续迭代计划：
 
-1. **任务队列与并发治理（上线前必须，唯一剩余 P0）**：当前 `asyncio.create_task` 进程内执行，重启即丢、无法水平扩容；`active_tasks` 是进程内 dict，多 worker 部署下取消接口失效。引入 Celery / ARQ / Temporal，Agent 执行与 API 进程分离，任务状态入 Redis 或数据库，事件广播换 Redis Stream（本批事件存储已按 append/read_after 可替换语义设计，替换只改实现类）。~~限流与成本控制~~（第三批完成）、~~事件回放单机版~~（第四批完成，多副本广播仍需本项）、~~token 预算熔断（run 级）~~（第四批完成）。
-2. **可观测性**：`print` 全量替换为结构化日志（logging + JSON formatter），接入 OpenTelemetry trace（LangSmith / LangFuse 追踪 Agent 链路），Prometheus 指标（任务时长、工具失败率、LLM token 消耗）+ 告警。
-3. **评测体系**：~~固定评测集~~（最小版已建：`eval/` 20 用例 + 确定性判分 + LLM-as-judge）；待扩到 50 条并接 CI 做回归。这是 Agent 项目区别于 demo 的核心证据。
-4. **CI/CD**：GitHub Actions（lint + pytest + tsc + build），pre-commit 已有配置需补齐 ruff/mypy 钩子；后端目前无 Dockerfile（只有 MySQL compose），需补多阶段构建镜像。
+> **本节状态**：2026-09-05 复核更新。第 2、3、4 项中的部分内容已由本轮 7 笔提交完成，已就地标注。
+
+1. **任务队列与并发治理（上线前必须，唯一剩余 P0，一行未动）**：当前 `asyncio.create_task`（`server.py:348`）进程内执行，重启即丢、无法水平扩容；`active_tasks` 是进程内 dict，多 worker 部署下取消接口失效。引入 ARQ（**注意：ARQ 强依赖 Redis，不能与"纯 SQLite"组合**），Agent 执行与 API 进程分离，任务状态入 Redis 或数据库，事件广播换 Redis Stream（事件存储已按 append/read_after 可替换语义设计，替换只改实现类）。~~限流与成本控制~~（第三批完成）、~~事件回放单机版~~（第四批完成）、~~token 预算熔断（run 级）~~（第四批完成）。
+2. **可观测性**：~~`print` 全量替换为结构化日志~~ ✅ **已完成**（`9506b8a`：标准库 logging + contextvars，JsonFormatter 输出 ts/level/trace_id/user_id/thread_id，生产路径 print 清零）。**仍待做**：OpenTelemetry trace（LangSmith / LangFuse）、Prometheus 指标（任务时长、工具失败率、LLM token 消耗）+ 告警。**结构化日志是 OTel 的前置，现已就位。**
+3. **评测体系**：~~固定评测集~~（已建：`eval/` **45 条** = sql 22 / routing 6 / web 10 / multi 7，确定性判分 + LLM-as-judge）；CI 已接入**结构自检**（`3e91737`：校验 id 唯一性与字段完整，不调真实 Agent）。**⚠️ 关键缺口：至今未跑出过任何一份基线**（缺 `.env` 与 MySQL 容器）——这是 Agent 项目区别于 demo 的核心证据，而目前是"证据为零"状态。**下一步第一优先级就是跑基线，而不是继续扩量。**
+4. **CI/CD**：~~GitHub Actions~~ **已部分完成**（`.github/workflows/ci.yml`：pytest + `eval/cases.py` 结构自检 + 前端 `tsc -b`）。**仍待做**：pre-commit 补齐 ruff/mypy 钩子；后端**无 Dockerfile**（只有 MySQL compose），需补多阶段构建镜像。**另注**：`ci.yml:14` 的 PR 触发分支列表仍含已不存在的 `production-hardening`，属失效配置。
 5. **内容安全**：上传文件病毒扫描（ClamAV）、模型输出审核（涉政/敏感词）、提示注入防护（系统提示与用户输入隔离、工具结果标记为不可信数据）。
 6. **认证升级路径**：当前 API Key 适合个人/小团队部署；对外多用户产品需换 OIDC（Authing / Casdoor / Auth0）+ JWT。~~短时令牌替代查询参数密钥~~（P1-2 已完成：WS 用 60 秒令牌、下载走请求头，`api_key` 查询参数仅剩兼容期旧入口待移除）；密钥轮换与吊销机制仍待做。
 
 ## 八、与上游教学版的关系
 
-本仓库基于开源教学项目 deepsearch-agents（MIT 协议）。简历与面试中的正确定位是：
-"基于开源教学项目做了**生产化改造**：四批改造 + 两次正式代码审查修复，覆盖路径穿越、
-SQL 任意执行、横向越权、无认证、租户串台、无限流、事件不可回放、任务无超时等 16 类问题，154 个回归测试"——
-而不是把整个项目说成从零自研。
+本仓库基于开源教学项目 deepsearch-agents（MIT 协议），上游基线 `df6d52e`（作者 didilili，2026-05-18）。
+
+**简历与面试中的正确定位**（2026-09-05 数字口径）：
+
+> "基于开源教学项目做了**生产化改造**：18 笔提交、53 文件 / +6193 行增量，覆盖路径穿越、SQL 任意执行、横向越权、无认证、租户串台、无限流、事件不可回放、任务无超时、工具无超时重试、日志不可追踪、提示词与工具不一致等问题，154 个回归测试（28.8 秒跑完）+ 45 条评测集"——而不是把整个项目说成从零自研。
+
+**三条必须遵守的诚实口径**：
+
+1. **不要说分支名** `production-hardening`——该分支不存在，仓库只有 `main`。查看增量的命令是 `git diff df6d52e..HEAD`，**不是** `git diff main`（后者恒为空）。
+2. **不要声称项目已上线或已评测**。项目未部署、无真实用户；45 条评测集**从未跑出过基线**（缺 Key 与 MySQL），不能报任何准确率。
+3. **主动区分"已验证"与"已实现"**：154 单测是实测跑通的；而端到端链路、工具业务逻辑（CSV 拼接、PDF 转换、RAGFlow SSE 解析）零覆盖。
+
 能逐条讲清楚"原版哪里有洞、我怎么修的、怎么验证的"，比笼统的"独立开发"更可信。

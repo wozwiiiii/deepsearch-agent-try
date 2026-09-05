@@ -23,14 +23,29 @@ from app.agent.llm import model
 # 确定性判定（不调 LLM）
 # ---------------------------------------------------------------------------
 
+# 数字格式归一化：模型常把 160000 写成 "160,000" 或 "1,200,000.00"，
+# 朴素子串匹配会因千分位/小数尾零误判 FAIL（sql-06/07/09 首跑基线实测暴露）。
+# 归一化只作用于数字相邻字符，对中文药名等文本匹配无影响。
+_THOUSANDS_RE = re.compile(r"(?<=\d),(?=\d)")
+_TRAILING_DOT_ZERO_RE = re.compile(r"(?<=\d)\.0+")
+
+
+def _normalize_for_match(text: str) -> str:
+    """匹配前归一化：小写化 + 去千分位逗号 + 去 .00 式小数尾零"""
+    text = (text or "").lower()
+    text = _THOUSANDS_RE.sub("", text)
+    return _TRAILING_DOT_ZERO_RE.sub("", text)
+
+
 def judge_sql(result: str, expected_facts: tuple[str, ...]) -> dict:
-    """SQL 类：期望事实全部作为子串出现即通过"""
-    text = (result or "").lower()
-    missing = [f for f in expected_facts if f.lower() not in text]
+    """SQL 类：期望事实全部作为子串出现即通过（大小写不敏感、数字格式归一）"""
+    text = _normalize_for_match(result)
+    missing = [f for f in expected_facts
+               if _normalize_for_match(f) not in text]
     return {
         "pass": len(missing) == 0,
         "score": 1.0 if not missing else 0.0,
-        "detail": {"matched": [f for f in expected_facts if f.lower() in text],
+        "detail": {"matched": [f for f in expected_facts if f not in missing],
                    "missing": missing},
     }
 
@@ -38,9 +53,23 @@ def judge_sql(result: str, expected_facts: tuple[str, ...]) -> dict:
 def judge_routing(tools: list[str], assistants: list[str],
                   expected_tools: tuple[str, ...],
                   expected_assistants: tuple[str, ...]) -> dict:
-    """路由类：命中期望工具或子智能体任一即通过"""
-    hit_tool = any(t in expected_tools for t in tools) if expected_tools else False
-    hit_asst = any(a in expected_assistants for a in assistants) if expected_assistants else False
+    """路由类：命中期望工具或子智能体任一即通过
+
+    匹配语义：期望标识符是"记录名"的子串即算命中。monitor 上报的工具名
+    带中文展示前缀（如 "数据库表数据查询工具：execute_sql_query"）、
+    子智能体注册名是中文（如 "数据库查询助手"），因此期望值
+    （"execute_sql_query" / "数据库查询助手"）必须是记录名的子串方向。
+    旧实现方向写反（记录名 in 期望元组做精确成员判断），6 条路由用例
+    全部误判 0 分——首跑基线实测暴露。
+    """
+    hit_tool = (
+        any(exp in t for t in tools for exp in expected_tools)
+        if expected_tools else False
+    )
+    hit_asst = (
+        any(exp in a for a in assistants for exp in expected_assistants)
+        if expected_assistants else False
+    )
     passed = hit_tool or hit_asst
     return {
         "pass": passed,

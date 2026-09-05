@@ -14,7 +14,11 @@ from langchain.chat_models import init_chat_model
 load_dotenv(find_dotenv())
 
 # 使用 OpenAI 兼容协议接入模型；具体模型名由 .env 中的 LLM_QWEN_MAX 控制
+# max_retries=2：底层 ChatOpenAI 仅在连接失败/可重试错误时自动重试（指数退避），
+# 避免网络半开等瞬时故障把同步调用线程永久挂起。.env 仅有 qwen-max 一个端点，
+# 无第二可降级模型，故只加重试不做 fallback
 model = init_chat_model(
     model=os.getenv("LLM_QWEN_MAX"),
     model_provider="openai",
+    max_retries=2,
 )

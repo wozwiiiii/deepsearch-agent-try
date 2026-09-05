@@ -33,8 +33,13 @@ from app.api.context import (
     reset_session_context,
     set_session_context,
     set_thread_context,
+    set_trace_context,
+    set_user_context,
 )
 from app.api.monitor import monitor
+from app.utils.logging_setup import get_logger
+
+logger = get_logger(__name__)
 
 # 文件类工具由主智能体直接掌握，负责读取上传附件和生成最终交付文档
 from app.tools.markdown_tools import generate_markdown
@@ -44,9 +49,13 @@ from app.tools.upload_file_read_tool import read_file_content
 # 当前文件位于 app/agent/main_agent.py，parents[1] 即 app 目录
 project_root_path = Path(__file__).parents[1].resolve()
 
-# 检查点数据库路径：默认 app/data/checkpoints.sqlite3，可用 CHECKPOINT_DB 覆盖
-CHECKPOINT_DB = os.getenv(
-    "CHECKPOINT_DB", str(project_root_path / "data" / "checkpoints.sqlite3")
+# 检查点数据库路径：默认 app/data/checkpoints.sqlite3，可用 CHECKPOINT_DB 覆盖。
+# 注意用 or 而非 getenv 第二参数：.env.example 引导用户留空（CHECKPOINT_DB=），
+# 而 os.getenv(key, default) 在 key 存在但值为空字符串时返回 ""，
+# Path("") 即当前目录，aiosqlite 会报 "unable to open database file"（评测首跑实测踩中）
+CHECKPOINT_DB = (
+    os.getenv("CHECKPOINT_DB")
+    or str(project_root_path / "data" / "checkpoints.sqlite3")
 )
 
 # 模型调用次数硬上限（第三批成本治理）：
@@ -81,13 +90,20 @@ MODEL_TOKEN_RUN_LIMIT = int(os.getenv("MODEL_TOKEN_RUN_LIMIT", "1500000"))
 _main_agent = None
 _agent_init_lock = asyncio.Lock()
 _checkpoint_saver = None
+# 关键：必须同时持有 context manager 对象本身。from_conn_string 是
+# @asynccontextmanager（挂起的 async generator），若只保存 __aenter__ 的返回值，
+# 局部变量 saver_ctx 在本函数返回后即被 GC，asyncio 的 asyncgen 终结机制会
+# aclose 它 → 内层 "async with aiosqlite.connect(...)" 退出 → 正在服务的
+# checkpointer 连接被关闭，后续所有 checkpoint 读写报
+# "Cannot operate on a closed database"/"Connection closed"（评测首跑实测踩中）
+_checkpoint_saver_ctx = None
 
 
 async def _get_agent():
     """
     返回可复用的主智能体实例，首次调用时完成组装和持久化 checkpointer 初始化
     """
-    global _main_agent, _checkpoint_saver
+    global _main_agent, _checkpoint_saver, _checkpoint_saver_ctx
     if _main_agent is not None:
         return _main_agent
 
@@ -98,9 +114,11 @@ async def _get_agent():
         db_path = Path(CHECKPOINT_DB)
         db_path.parent.mkdir(parents=True, exist_ok=True)
 
-        # from_conn_string 返回异步上下文管理器；这里显式进入并保持到进程结束，
-        # 连接随进程退出由操作系统回收（SQLite WAL 下中断是安全的）
+        # from_conn_string 返回异步上下文管理器；这里显式进入并保持到进程结束。
+        # 注意 context manager 本身必须存入全局（见 _checkpoint_saver_ctx 注释），
+        # 否则被 GC 时会连带关闭正在服务的连接
         saver_ctx = AsyncSqliteSaver.from_conn_string(str(db_path))
+        _checkpoint_saver_ctx = saver_ctx
         _checkpoint_saver = await saver_ctx.__aenter__()
 
         _main_agent = create_deep_agent(
@@ -122,11 +140,32 @@ async def _get_agent():
                 )
             ],
         )
-        print(
+        logger.info(
             f"[MainAgent] 已初始化，checkpointer=sqlite:{db_path}，"
             f"模型调用上限 run={MODEL_RUN_LIMIT}/thread={MODEL_THREAD_LIMIT}"
         )
         return _main_agent
+
+
+async def close_main_agent() -> None:
+    """
+    显式释放主智能体与 checkpointer 连接（脚本/评测进程退出前调用）
+
+    FastAPI 服务进程常驻，连接随进程生命周期回收即可；但脚本场景
+    （eval.runner、诊断探针）跑完就退出，aiosqlite 的 worker 线程是
+    非 daemon 线程，不显式关闭会让 threading._shutdown 永久 join，
+    进程即使主流程结束也挂住不退（实测 13 分钟不退出的事故组成之一）。
+    """
+    global _main_agent, _checkpoint_saver, _checkpoint_saver_ctx
+    _main_agent = None
+    if _checkpoint_saver_ctx is not None:
+        ctx = _checkpoint_saver_ctx
+        _checkpoint_saver_ctx = None
+        _checkpoint_saver = None
+        try:
+            await ctx.__aexit__(None, None, None)
+        except Exception as e:
+            logger.warning(f"[MainAgent] 关闭 checkpointer 时异常（忽略）: {e}")
 
 
 async def _consume_agent_stream(agent_factory, message: str, config: dict) -> None:
@@ -187,10 +226,13 @@ async def _consume_agent_stream(agent_factory, message: str, config: dict) -> No
                                 )
                     elif last_msg.content:
                         # 模型没有继续调用工具时，最新文本内容就是本轮可反馈给前端的结果
-                        print(
+                        logger.info(
                             f"主智能体执行结果，最终结果：{last_msg.content[:100]}"
                         )
                         monitor.report_task_result(last_msg.content)
+
+    # 返回本次任务的实际 token 消耗（评测成本核算用；熔断之外的可观测性输出）
+    return tokens_used
 
 
 async def run_deep_agent(task_query, session_id, user_id="local"):
@@ -204,7 +246,11 @@ async def run_deep_agent(task_query, session_id, user_id="local"):
     :param session_id: 当前任务 ID，同时用于输出目录和 WebSocket 定向推送
     :param user_id: 租户身份，目录、checkpointer 和推送路由都按其隔离
     """
-    print(f"[MainAgent] 开始执行会话，user_id={user_id}，session_id={session_id}")
+    # 先落 trace/user 上下文，让本次任务从入口日志开始就携带 trace_id/user_id
+    trace_id, trace_token = set_trace_context()
+    user_token = set_user_context(user_id)
+
+    logger.info(f"[MainAgent] 开始执行会话，user_id={user_id}，session_id={session_id}")
 
     # 每个租户每个会话独立使用 output/user_{uid}/session_{session_id}，
     # 避免不同用户的产物互相覆盖或互访
@@ -253,6 +299,9 @@ async def run_deep_agent(task_query, session_id, user_id="local"):
     # checkpointer 依赖 thread_id 区分会话记忆；复合键保证租户间状态隔离
     config = {"configurable": {"thread_id": routing_key}}
 
+    # 实际 token 消耗（wait_for 超时/异常时保留已消耗部分；无调用则为 0）
+    tokens_used = 0
+
     # 工作环境指令是运行时动态补充的，约束模型只在当前会话目录读写文件
     path_instruction = f"""
     【工作环境指令】
@@ -269,7 +318,7 @@ async def run_deep_agent(task_query, session_id, user_id="local"):
     try:
         # 硬超时兜底（P1-4）：LLM 网络半开或失控循环会让任务永远停在"运行中"。
         # 超时取消内部执行并经 monitor 告知前端；用户主动取消走 CancelledError 分支
-        await asyncio.wait_for(
+        tokens_used = await asyncio.wait_for(
             _consume_agent_stream(
                 _get_agent, task_query + path_instruction, config
             ),
@@ -290,7 +339,13 @@ async def run_deep_agent(task_query, session_id, user_id="local"):
         monitor.report_error(f"执行主智能发生异常信息：{str(e)}")
     finally:
         # 任务结束后恢复 ContextVar，避免后续请求复用到本次会话目录或 thread_id
-        reset_session_context(session_dir_token, session_id_token)
+        reset_session_context(
+            session_dir_token, session_id_token, trace_token, user_token
+        )
+
+    # 返回实际 token 消耗（正常完成/超时/异常均尽力返回已消耗部分；
+    # API 层不使用返回值，评测 runner 用它做单条成本核算）
+    return tokens_used
 
 
 if __name__ == "__main__":

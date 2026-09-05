@@ -104,23 +104,32 @@ python -m uv run pytest tests/ -q -k "union"     # 按名筛选
 
 ---
 
-## 三、看自己改了什么：`git diff main`
+## 三、看自己改了什么：`git diff df6d52e..HEAD`
 
-这是项目最有用的一条命令——所有改造都在 `production-hardening` 分支，`main` 与上游教学项目对齐：
+> **⚠️ 2026-09-05 更正**：本节原标题为"`git diff main`"，并称"所有改造都在 `production-hardening` 分支，main 与上游对齐"——**该分支不存在**（`git branch -a` 仅 `main`），且增量已在 main 上，故 `git diff main` **输出恒为空**。请使用下面的命令。
 
 ```bash
-git log --oneline -4
-# 70f3162 安全加固第一批
-# d2bc74e 认证/租户/持久化第二批
-# 62f13ab 限流/成本/审查修复第三批
-# 3ccd40b UNION 补 LIMIT 修复
+git log --oneline -6
+# 66f85e9 评测集扩量到 45 条
+# 9506b8a 结构化日志 + trace_id
+# c0b5b45 同步 I/O 超时与重试
+# c11fd2b 提示词矛盾修复
+# f4f1995 CI 处理
+# 2a0db27 短时链接令牌
 
-git diff main --stat                 # 改了哪些文件、多少行
-git diff main -- app/tools/db_tools.py   # 看某个文件全量改造
-git diff main -- tests/              # 看测试全量
+# 本人全部增量（df6d52e 是上游 didilili 的最后一笔，2026-05-18）
+git diff --shortstat df6d52e..HEAD      # 53 files changed, 6193 insertions(+), 546 deletions(-)
+git diff --stat df6d52e..HEAD           # 逐文件明细
+git diff df6d52e..HEAD -- app/tools/db_tools.py   # 看某个文件全量改造
+git diff df6d52e..HEAD -- tests/                  # 看测试全量
+
+# 只看本轮 7 笔（已提交未推送）
+git diff --shortstat c11fd2b^..HEAD     # 17 files changed, 531 insertions(+), 116 deletions(-)
 ```
 
-面试前用 `git diff main` 自检：嘴里说的每条改造，代码里都得有对应。
+面试前用 `git diff df6d52e..HEAD` 自检：嘴里说的每条改造，代码里都得有对应。
+
+**口径提醒**：不同统计口径数字不同，引用时须指明——全量 53 文件 / +6193；只算生产化改造（自 `70f3162` 起）51 文件 / +6191；排除 `uv.lock` 等锁文件 52 文件 / +6025。旧文档写的"40 文件 / +3649"是中间时点统计，已作废。
 
 ---
 
@@ -129,7 +138,10 @@ git diff main -- tests/              # 看测试全量
 ```bash
 # 自检（不需服务，只验用例结构）
 python -m eval.cases
-# 期望：共 20 个用例 + 用例自检通过
+# 期望：共 45 个用例：{'sql': 22, 'routing': 6, 'web': 10, 'multi': 7} + 用例自检通过
+
+# ⚠️ 本命令也已在 CI 中执行（.github/workflows/ci.yml），
+#    但它只做结构校验（id 唯一性、字段完整），不调用真实 Agent。
 
 # 跑 SQL 类（最快，不依赖网络）
 python -m eval.runner --category sql
@@ -208,7 +220,7 @@ docker exec -it <mysql容器> mysql -uroot -p deepsearch_db -e "SHOW TABLES; SEL
 ## 七、深入项目的推荐顺序
 
 1. 读 `AGENTS.md`（工作区指引，改代码前必读）；
-2. `git diff main --stat` 看全貌；
+2. `git diff --stat df6d52e..HEAD` 看全貌（**不要用 `git diff main`**，增量已在 main 上，该命令恒为空）；
 3. 读 `面试/01-项目结构与核心逻辑解析.md`（结构）→ `02-安全防护机制详解.md`（安全）→ `03-现存缺陷与改进路线.md`（缺陷）→ `04-面试官问题清单与参考回答.md`（问答）；
 4. 跑测试 `pytest tests/ -q` 确认绿；
 5. 配 `.env` 起服务，前端发一个真实任务，看后端 `[Monitor]` 日志走一遍主智能体→子智能体→工具→结果的链路；

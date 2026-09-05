@@ -10,6 +10,10 @@ from typing import Any
 
 import yaml
 
+from app.utils.logging_setup import get_logger
+
+logger = get_logger(__name__)
+
 
 def load_yaml(file_path: Path) -> dict[str, Any]:
     """
@@ -35,4 +39,4 @@ main_agent_content = prompt_yaml_content["main_agent"]
 # 子智能体配置集合，包含 name、description 和 system_prompt
 sub_agents_content = prompt_yaml_content["sub_agents"]
 
-print(sub_agents_content)
+logger.debug(sub_agents_content)

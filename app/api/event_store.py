@@ -63,15 +63,22 @@ class SqliteEventStore:
         max_per_stream: Optional[int] = None,
         replay_limit: Optional[int] = None,
     ) -> None:
-        # 路径与容量参数在实例化时解析，测试可通过构造参数显式指定 tmp_path
-        self.db_path = db_path or os.getenv(
-            "EVENT_DB", str(_PROJECT_ROOT / "data" / "events.sqlite3")
+        # 路径与容量参数在实例化时解析，测试可通过构造参数显式指定 tmp_path。
+        # env 空值容错用 or 链（同 main_agent.CHECKPOINT_DB）：
+        # .env 里 EVENT_DB= 留空时 os.getenv 返回 "" 而非 default，
+        # Path("") 会让 aiosqlite 报 "unable to open database file"
+        self.db_path = (
+            db_path
+            or os.getenv("EVENT_DB")
+            or str(_PROJECT_ROOT / "data" / "events.sqlite3")
         )
         self.max_per_stream = max_per_stream or int(
-            os.getenv("EVENT_MAX_PER_STREAM", "1000")
+            os.getenv("EVENT_MAX_PER_STREAM") or "1000"
         )
         # 首次连接（无 last_seq）时的默认补发条数：页面刷新可恢复最近一轮执行轨迹
-        self.replay_limit = replay_limit or int(os.getenv("EVENT_REPLAY_LIMIT", "100"))
+        self.replay_limit = replay_limit or int(
+            os.getenv("EVENT_REPLAY_LIMIT") or "100"
+        )
         self._conn: Optional[aiosqlite.Connection] = None
         self._lock = asyncio.Lock()
 

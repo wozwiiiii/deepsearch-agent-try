@@ -4,14 +4,17 @@
 #       不需要真实 LLM/Tavily/MySQL 服务）。
 # 前端：pnpm 安装依赖后跑 TypeScript 类型检查。
 #
-# 触发：push 到任意分支 + 针对 main/production-hardening 的 PR。
+# 触发：push 到任意分支 + 针对 main 的 PR。
+#
+# 注：此处原为 [main, production-hardening]，但 production-hardening 分支并不存在
+# （git branch -a 仅 main），属失效配置，2026-09-05 移除。
 
 name: CI
 
 on:
   push:
   pull_request:
-    branches: [main, production-hardening]
+    branches: [main]
 
 jobs:
   backend:
@@ -32,6 +35,14 @@ jobs:
 
       - name: Run tests
         run: python -m uv run pytest tests/ -q
+
+      # 评测集结构自检（零依赖、不需要真实模型/数据库）：
+      # 校验用例总数、分类分布、id 唯一性与各类必备字段，
+      # 防止对 eval/cases.py 的数据改动破坏评测集结构。
+      # 注意：全量评测（eval/runner.py）需要真实 OPENAI/TAVILY/MySQL，
+      # 不进 CI，仍按 eval/README.md 在本地手动运行。
+      - name: Eval cases structure check
+        run: python -m uv run python eval/cases.py
 
   frontend:
     name: Frontend typecheck (tsc)
