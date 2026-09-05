@@ -40,6 +40,7 @@ from app.api.context import (
     set_thread_context,
     set_trace_context,
     set_user_context,
+    set_user_message_context,
 )
 from app.api.monitor import monitor
 from app.utils.logging_setup import get_logger
@@ -341,6 +342,10 @@ async def run_deep_agent(task_query, session_id, user_id="local"):
     # ContextVar 让深层工具无需显式传参，也能拿到当前会话目录和 WebSocket 路由键
     session_dir_token = set_session_context(session_dir_str)
     session_id_token = set_thread_context(routing_key)
+    # 用户原始消息供文件生成类工具做文件产出意图硬校验（file_intent_guard）。
+    # 必须存原始 task_query：path_instruction 里含"生成文件"等运行时指令字样，
+    # 混入会让所有任务都被误判为"用户要求生成文件"，守卫彻底失效
+    user_message_token = set_user_message_context(str(task_query or ""))
 
     # 前端拿到工作目录后，可以展示本次任务生成的 Markdown/PDF 等产物
     monitor.report_session_dir(session_dir_str)
@@ -389,7 +394,11 @@ async def run_deep_agent(task_query, session_id, user_id="local"):
     finally:
         # 任务结束后恢复 ContextVar，避免后续请求复用到本次会话目录或 thread_id
         reset_session_context(
-            session_dir_token, session_id_token, trace_token, user_token
+            session_dir_token,
+            session_id_token,
+            trace_token,
+            user_token,
+            user_message_token,
         )
 
     # 返回实际 token 消耗（正常完成/超时/异常均尽力返回已消耗部分；

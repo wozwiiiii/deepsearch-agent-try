@@ -15,6 +15,7 @@ from langchain_core.tools import tool
 
 from app.api.context import get_session_context
 from app.api.monitor import monitor
+from app.tools.file_intent_guard import ensure_file_output_requested
 from app.utils.logging_setup import get_logger
 from app.utils.path_utils import PathEscapeError, resolve_path
 
@@ -35,6 +36,12 @@ def generate_markdown(
     :param path: 可选保存路径；通常由运行时工作目录指令约束为相对路径
     :return: 文件生成结果说明
     """
+    # 文件产出意图硬校验（P2 劫持修复）：用户未要求生成文件时拒绝执行，
+    # 引导模型直接在最终回答文本中给出结论。放行路径与原逻辑完全一致
+    refusal = ensure_file_output_requested()
+    if refusal:
+        return refusal
+
     logger.info(f"[MarkdownTool] 输入保存路径: {path or '当前会话目录'}")
     monitor.report_tool("Markdown文档生成工具", {"写入的文本内容": content})
     if not filename.endswith(".md"):

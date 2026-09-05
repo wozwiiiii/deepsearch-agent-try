@@ -27,6 +27,13 @@ _user_id_ctx: ContextVar[Optional[str]] = ContextVar(
     "user_id",
     default=None,
 )
+# 触发本次任务的用户原始消息（P2 文件生成劫持修复）：文件生成类工具在入口
+# 读取它做文件产出意图硬校验。注意存的是原始 task_query——不含 run_deep_agent
+# 拼接的工作环境指令（指令里含"生成文件"等字样，混入会污染意图判定）
+_user_message_ctx: ContextVar[Optional[str]] = ContextVar(
+    "user_message",
+    default=None,
+)
 
 
 def set_session_context(path: str) -> Token[Optional[str]]:
@@ -108,11 +115,31 @@ def get_user_context() -> Optional[str]:
     return _user_id_ctx.get()
 
 
+def set_user_message_context(message: str) -> Token[Optional[str]]:
+    """
+    设置当前请求链路的用户原始消息
+
+    :param message: 触发本次任务的用户原始问题（不含运行时拼接的指令）
+    :return: reset 时需要使用的上下文 token
+    """
+    return _user_message_ctx.set(message)
+
+
+def get_user_message_context() -> Optional[str]:
+    """
+    获取当前请求链路的用户原始消息
+
+    :return: 触发本次任务的用户原始问题；未设置时返回 None
+    """
+    return _user_message_ctx.get()
+
+
 def reset_session_context(
     session_token: Token[Optional[str]],
     thread_token: Optional[Token[Optional[str]]] = None,
     trace_token: Optional[Token[Optional[str]]] = None,
     user_token: Optional[Token[Optional[str]]] = None,
+    message_token: Optional[Token[Optional[str]]] = None,
 ) -> None:
     """
     恢复请求上下文，避免本次任务信息残留到后续请求
@@ -121,6 +148,7 @@ def reset_session_context(
     :param thread_token: set_thread_context 返回的 token
     :param trace_token: set_trace_context 返回的 token
     :param user_token: set_user_context 返回的 token
+    :param message_token: set_user_message_context 返回的 token
     """
     _session_dir_ctx.reset(session_token)
     if thread_token is not None:
@@ -129,3 +157,5 @@ def reset_session_context(
         _trace_id_ctx.reset(trace_token)
     if user_token is not None:
         _user_id_ctx.reset(user_token)
+    if message_token is not None:
+        _user_message_ctx.reset(message_token)

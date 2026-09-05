@@ -16,6 +16,7 @@ from langchain_core.tools import tool
 
 from app.api.context import get_session_context
 from app.api.monitor import monitor
+from app.tools.file_intent_guard import ensure_file_output_requested
 from app.utils.logging_setup import get_logger
 from app.utils.path_utils import PathEscapeError, resolve_path
 from app.utils.word_converter import convert_md_to_pdf as convert_md_to_pdf_via_word
@@ -37,6 +38,12 @@ def convert_md_to_pdf(
     :param pdf_filename: 可选 PDF 输出文件名；不传时与 Markdown 同名
     :return: 转换结果说明
     """
+    # 文件产出意图硬校验（P2 劫持修复）：与 generate_markdown 同一守卫，
+    # 用户未要求产出文件时拒绝转换。放行路径与原逻辑完全一致
+    refusal = ensure_file_output_requested()
+    if refusal:
+        return refusal
+
     monitor.report_tool("Markdown转PDF工具")
 
     try:
