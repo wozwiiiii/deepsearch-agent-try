@@ -96,7 +96,7 @@ def authenticate_api_key(api_key: str | None) -> Principal:
     """
     校验 API Key 并返回所属租户身份
 
-    :param api_key: 请求携带的密钥（HTTP 头 X-API-Key 或 WS 查询参数 api_key）
+    :param api_key: 请求携带的密钥（HTTP 头 X-API-Key；WS 查询参数旧入口已移除）
     :return: 匹配的 Principal
     :raises HTTPException: 401 密钥无效；503 未配置密钥且未显式开启开发模式
     """

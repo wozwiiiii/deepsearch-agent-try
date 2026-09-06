@@ -68,14 +68,14 @@ def test_more_positive_phrases_are_allowed():
 
 def test_web07_exact_phrase_is_rejected():
     """web-07 实际劫持场景原句必须拒绝"""
-    assert has_file_output_intent("搜索质子泵抑制剂长期使用的潜在风险") is False
+    assert has_file_output_intent("搜索质子泵抑制剂（如奥美拉唑）长期使用的潜在风险。") is False
 
 
 def test_more_negative_phrases_are_rejected():
     """无文件产出意图的查询表述全部拒绝"""
     negatives = [
         "把结果整理一下",             # 只有动作词，无文件词
-        "搜索质子泵抑制剂长期使用的潜在风险",  # web-07：动作词、文件词均无
+        "搜索质子泵抑制剂（如奥美拉唑）长期使用的潜在风险。",  # web-07：动作词、文件词均无
         "查一下库存最多的药品",         # 纯查询
         "总结一下这些风险",           # "总结"作动词用且无文件词
         "汇总一下各渠道的销售数据",     # 汇总但无文件词
@@ -133,7 +133,7 @@ def test_guard_allows_when_intent_present():
 def test_guard_refuses_when_intent_absent():
     """用户消息不含文件产出意图 → 返回引导性拒绝信息"""
     session_token = set_session_context("/tmp/guard-dummy")
-    message_token = set_user_message_context("搜索质子泵抑制剂长期使用的潜在风险")
+    message_token = set_user_message_context("搜索质子泵抑制剂（如奥美拉唑）长期使用的潜在风险。")
     try:
         refusal = ensure_file_output_requested()
         assert refusal == FILE_INTENT_REFUSAL_MESSAGE
@@ -175,7 +175,7 @@ def test_generate_markdown_allows_route04_and_writes_file(tmp_path):
 def test_generate_markdown_refuses_web07_without_side_effect(tmp_path):
     """web-07 表述：守卫拒绝，返回引导信息且不产生任何文件"""
     session_token, message_token = _set_session(
-        str(tmp_path), "搜索质子泵抑制剂长期使用的潜在风险"
+        str(tmp_path), "搜索质子泵抑制剂（如奥美拉唑）长期使用的潜在风险。"
     )
     try:
         result = generate_markdown.invoke(
@@ -222,7 +222,7 @@ def test_generate_markdown_boundary_phrases(tmp_path):
 def test_convert_md_to_pdf_refuses_web07(tmp_path):
     """convert_md_to_pdf 同样受守卫约束：web-07 表述拒绝且不触碰文件系统"""
     session_token, message_token = _set_session(
-        str(tmp_path), "搜索质子泵抑制剂长期使用的潜在风险"
+        str(tmp_path), "搜索质子泵抑制剂（如奥美拉唑）长期使用的潜在风险。"
     )
     try:
         result = convert_md_to_pdf.invoke({"md_filename": "不存在.md"})

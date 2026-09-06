@@ -116,7 +116,8 @@ def _rate_limit_key(request: Request) -> str:
     注意：反向代理后面所有用户共享 IP，生产部署应配置可信的 X-Forwarded-For
     解析（PROXY_COUNT）或确保所有客户端都携带密钥。
     """
-    api_key = request.headers.get("X-API-Key") or request.query_params.get("api_key")
+    # api_key 查询参数旧入口已移除：限流键只认请求头密钥，其余按客户端 IP 计
+    api_key = request.headers.get("X-API-Key")
     if api_key:
         digest = hashlib.sha256(api_key.encode("utf-8")).hexdigest()[:16]
         return f"key:{digest}"
@@ -164,24 +165,23 @@ def composite_task_key(user_id: str, thread_id: str) -> str:
 async def require_principal_for_link(
     x_api_key: str | None = Header(default=None, alias="X-API-Key"),
     token: str | None = None,
-    api_key: str | None = None,
 ) -> Principal:
     """
     浏览器直链（下载、WebSocket）的认证依赖，按安全优先级依次尝试：
 
     1. X-API-Key 请求头（fetch/axios 可带，密钥不进 URL）；
-    2. 短时链接令牌（P1-2，60 秒有效，替代查询参数里的长期密钥）；
-    3. api_key 查询参数——兼容期保留的旧入口，密钥会进访问日志/
-       浏览器历史/Referer，前端已不再发送，计划随 P0-2 移除。
+    2. 短时链接令牌（P1-2，60 秒有效，替代查询参数里的长期密钥）。
 
-    注意开发模式（未配置 API_KEYS）：三个凭据都为空时经
-    authenticate_api_key 走 ALLOW_DEV_MODE 分支，行为与之前一致。
+    api_key 查询参数旧入口已移除（密钥会进访问日志/浏览器历史/Referer）；
+    浏览器 WS/直链一律先经 POST /api/token 换取短时令牌。两者都缺失时走
+    authenticate_api_key(None)：开发模式放行，配置了 API_KEYS 则 fail-closed
+    拒绝（401）。
     """
     if x_api_key:
         return authenticate_api_key(x_api_key)
     if token:
         return resolve_link_token(token)
-    return authenticate_api_key(api_key)
+    return authenticate_api_key(None)
 
 
 def sanitize_filename(filename: str) -> str:
@@ -521,8 +521,8 @@ async def download_file(
     """
     文件下载接口 (File Download)。
 
-    鉴权按安全优先级：X-API-Key 头 > 短时令牌（token 参数）> api_key
-    查询参数（兼容期旧入口）；前端已改为 fetch + 请求头 + blob 下载，
+    鉴权按安全优先级：X-API-Key 头 > 短时令牌（token 参数）；api_key
+    查询参数旧入口已移除。前端已改为 fetch + 请求头 + blob 下载，
     正常路径下任何形式的密钥都不会出现在 URL 中。
 
     下载范围由服务端根据「当前租户 + thread_id」决定，path 参数只允许是
@@ -562,18 +562,20 @@ async def websocket_endpoint(websocket: WebSocket, thread_id: str):
     事件（含最终答案）不再丢失；不带 last_seq 的首次连接补发最近
     EVENT_REPLAY_LIMIT 条，页面刷新也能恢复上一轮执行轨迹。
 
-    P1-2 鉴权：浏览器无法为 WS 设置请求头，推荐先经 POST /api/token
-    换取 60 秒短时令牌再连接；api_key 查询参数为兼容期旧入口（前端已
-    不再发送）；开发模式（未配置 API_KEYS）无凭据直接放行。
+    P1-2 鉴权：浏览器无法为 WS 设置请求头，连接前先经 POST /api/token
+    换取 60 秒短时令牌，经 token 查询参数携带；api_key 查询参数旧入口
+    已移除（密钥会进访问日志/浏览器历史）；开发模式（未配置 API_KEYS）
+    无凭据直接放行。
     """
     try:
         link_token = websocket.query_params.get("token")
         if link_token:
             principal = resolve_link_token(link_token)
         else:
-            principal = authenticate_api_key(
-                websocket.query_params.get("api_key")
-            )
+            # api_key 查询参数旧入口已移除（密钥会进访问日志/浏览器历史）；
+            # 无令牌时走 authenticate_api_key(None)：开发模式放行，
+            # 配置了 API_KEYS 则 fail-closed 拒绝（401 → 握手 1008）
+            principal = authenticate_api_key(None)
     except HTTPException:
         # 未 accept 直接 close，Starlette 会以 403 拒绝握手
         await websocket.close(code=1008)

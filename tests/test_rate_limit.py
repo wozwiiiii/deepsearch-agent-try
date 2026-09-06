@@ -47,13 +47,17 @@ class TestRateLimitKey:
         # 键中不得出现明文密钥
         assert "sk-alice" not in key
 
-    def test_key_from_query_param_fallback(self):
+    def test_key_ignores_query_param_api_key(self):
+        """api_key 查询参数旧入口已移除：查询参数里的密钥不再参与限流键，
+        这类请求按客户端 IP 计（与无密钥请求一致）"""
         class _FakeRequest:
             headers = {}
             query_params = {"api_key": "sk-bob-0123456789abcdef"}
+            # get_remote_address 读取 request.client.host
+            client = type("Addr", (), {"host": "127.0.0.1", "port": 80})()
 
         key = server._rate_limit_key(_FakeRequest())
-        assert key.startswith("key:")
+        assert key.startswith("ip:")
 
     def test_key_falls_back_to_ip_without_key(self):
         class _FakeRequest:

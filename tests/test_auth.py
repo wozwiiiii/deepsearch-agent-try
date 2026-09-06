@@ -210,14 +210,15 @@ class TestTenantIsolation:
         )
         assert bob_download.status_code == 404
 
-    def test_download_via_query_param_auth(self, client, monkeypatch):
+    def test_download_via_query_param_auth_removed(self, client, monkeypatch):
+        """api_key 查询参数旧入口已移除：下载接口不再接受查询参数密钥（401）"""
         monkeypatch.setenv("API_KEYS", f"alice:{ALICE_KEY}")
         self._prepare_file("t-iso-dl")
         response = client.get(
             "/api/download",
             params={"thread_id": "t-iso-dl", "path": "secret.md", "api_key": ALICE_KEY},
         )
-        assert response.status_code == 200
+        assert response.status_code == 401
 
 
 class TestWebSocketAuth:
@@ -227,11 +228,12 @@ class TestWebSocketAuth:
             with client.websocket_connect("/ws/t-ws-1"):
                 pass
 
-    def test_ws_accepted_with_key(self, client, monkeypatch):
+    def test_ws_api_key_query_param_rejected(self, client, monkeypatch):
+        """api_key 查询参数旧入口已移除：携带它连接应 fail-closed 被拒"""
         monkeypatch.setenv("API_KEYS", f"alice:{ALICE_KEY}")
-        with client.websocket_connect(f"/ws/t-ws-2?api_key={ALICE_KEY}") as ws:
-            ws.send_text("ping")
-            assert ws.receive_json()["type"] == "pong"
+        with pytest.raises(WebSocketDisconnect):
+            with client.websocket_connect(f"/ws/t-ws-2?api_key={ALICE_KEY}"):
+                pass
 
     def test_ws_malformed_thread_id_rejected(self, client, monkeypatch):
         monkeypatch.delenv("API_KEYS", raising=False)
@@ -304,9 +306,9 @@ class TestLinkTokens:
             with client.websocket_connect("/ws/t-tok-bad?token=forged-token-value"):
                 pass
 
-    def test_api_key_query_param_still_accepted(self, client, monkeypatch):
-        """兼容期旧入口不回归：api_key 查询参数仍可完成 WS 握手"""
+    def test_api_key_query_param_removed(self, client, monkeypatch):
+        """兼容期已结束：api_key 查询参数不再被接受（fail-closed 拒绝握手）"""
         monkeypatch.setenv("API_KEYS", f"alice:{ALICE_KEY}")
-        with client.websocket_connect(f"/ws/t-tok-compat?api_key={ALICE_KEY}") as ws:
-            ws.send_text("ping")
-            assert ws.receive_json()["type"] == "pong"
+        with pytest.raises(WebSocketDisconnect):
+            with client.websocket_connect(f"/ws/t-tok-compat?api_key={ALICE_KEY}"):
+                pass

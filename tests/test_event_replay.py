@@ -282,10 +282,14 @@ class TestWsReplayProtocol:
             monitor._last_emit_handle.result(timeout=2)
             reset_session_context(session_token, thread_token)
 
-            # bob 连接同一 thread_id：事件库中 bob-{thread_id} 无任何事件，
-            # 第一条收到的消息应是心跳 pong 而不是 alice 的回放
+            # bob 连接同一 thread_id（经 POST /api/token 换短时令牌，
+            # api_key 查询参数旧入口已移除）：事件库中 bob-{thread_id} 无任何
+            # 事件，第一条收到的消息应是心跳 pong 而不是 alice 的回放
+            bob_token = client.post(
+                "/api/token", headers={"X-API-Key": "sk-bob-0123456789abcdef"}
+            ).json()["token"]
             with client.websocket_connect(
-                f"/ws/{thread_id}?api_key=sk-bob-0123456789abcdef"
+                f"/ws/{thread_id}?token={bob_token}"
             ) as ws:
                 ws.send_text("ping")
                 assert ws.receive_json()["type"] == "pong"

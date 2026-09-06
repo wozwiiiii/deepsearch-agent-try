@@ -114,9 +114,9 @@ export function useDeepAgentSession() {
           const { token } = await fetchLinkToken();
           params.set("token", token);
         } catch {
-          // 令牌服务不可用（如后端未升级）时回退兼容入口：
-          // 查询参数密钥，已弃用，仅保底不断连
-          params.set("api_key", API_KEY);
+          // 令牌服务不可用时不携带任何长期凭据：api_key 查询参数旧入口
+          // 已从后端移除（密钥进 URL 会泄露到访问日志/浏览器历史），
+          // 连接将被 fail-closed 拒绝并走既有重连逻辑
         }
       }
       if (lastSeqRef.current !== undefined) {
