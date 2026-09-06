@@ -1,0 +1,221 @@
+{
+  "generated_at": "2026-09-06T09:50:27.146442",
+  "total": 6,
+  "cases": [
+    {
+      "id": "route-01-db-routing",
+      "category": "routing",
+      "query": "查询数据库里治疗领域为高血压的药品有哪些，只看数据库，不用网络。",
+      "started_at": "2026-09-06T09:51:39.396380",
+      "result": "数据库中治疗高血压的药品包括：\n\n1. 硝苯地平控释片（拜新同）\n2. 氯沙坦钾片（科素亚）\n3. 苯磺酸氨氯地平片（络活喜）\n4. 缬沙坦胶囊（代文）\n\n这些药品都是专门用来治疗高血压的。",
+      "tools": [
+        "数据库表名查询工具：list_sql_tables",
+        "数据库表数据查询工具：get_table_data",
+        "数据库表数据查询工具：execute_sql_query"
+      ],
+      "assistants": [
+        "数据库查询助手"
+      ],
+      "errors": [],
+      "tokens_used": 16427,
+      "rate_limited": true,
+      "verdict": {
+        "pass": true,
+        "score": 1.0,
+        "detail": {
+          "tools_seen": [
+            "数据库表名查询工具：list_sql_tables",
+            "数据库表数据查询工具：get_table_data",
+            "数据库表数据查询工具：execute_sql_query"
+          ],
+          "assistants_seen": [
+            "数据库查询助手"
+          ],
+          "hit_tool": true,
+          "hit_assistant": true
+        }
+      }
+    },
+    {
+      "id": "route-02-web-routing",
+      "category": "routing",
+      "query": "用网络搜索一下奥司他韦治疗流感的最新临床指南，不要查数据库。",
+      "started_at": "2026-09-06T09:53:10.765737",
+      "result": "根据网络上的最新信息，奥司他韦治疗流感的临床指南总结如下：\n\n1. 最新研究表明，当起病48小时内开始使用奥司他韦治疗流感时，能有效缩短临床症状缓解时间。然而，这项治疗对住院率和死亡率的影响有限。奥司他韦的常见不良反应包括恶心和呕吐（[详细信息](https://www.huxijie.com/documents/%E5%AD%A6%E6%9C%AF/11145)）。\n2. 成人及青少年使用奥司他韦治疗流感时，推荐剂量为每天2次，每次75mg，连续使用5天；预防性使用时，为每天1次，每次75mg，最长可达6周。据称，奥司他韦的常见药物不良反应主要是恶心和呕吐，其发生率至少比安慰剂高1%（[详细信息](https://swin.zy91.com/pages/m-instruction/m.instruction.html?webHisId=34101&hospitalCode=1)）。\n3. 还有一篇指南建议成人治疗流感时，奥司他韦的剂量通常为每天一次，每次75mg，连续使用7到10天。针对不同年龄、体重的儿童，则有相应的剂量标准来提供更加具体的使用指导（[详细信息](https://www.chinagp.net/CN/10.12114/j.issn.1007-9572.2026.0005)）。\n\n以上来自几个不同来源的信息，可以提供关于奥司他韦治疗流感的最新临床指南的一些基本了解。需要更详细的信息，可以从上述链接中查询。",
+      "tools": [
+        "网络搜索工具"
+      ],
+      "assistants": [
+        "网络搜索助手"
+      ],
+      "errors": [],
+      "tokens_used": 17038,
+      "rate_limited": false,
+      "verdict": {
+        "pass": true,
+        "score": 1.0,
+        "detail": {
+          "tools_seen": [
+            "网络搜索工具"
+          ],
+          "assistants_seen": [
+            "网络搜索助手"
+          ],
+          "hit_tool": false,
+          "hit_assistant": true
+        }
+      }
+    },
+    {
+      "id": "route-03-knowledge-base",
+      "category": "routing",
+      "query": "查询公司内部知识库里关于药品仓储管理制度的规定内容。",
+      "started_at": "2026-09-06T09:54:21.941067",
+      "result": "暂时遇到了一些问题，无法通过内部知识库获取关于药品仓储管理制度的规定内容。建议您稍后再试或直接联系技术支持来获取相关信息。",
+      "tools": [
+        "ragflow聊天助手列表查询工具：get_assistant_list"
+      ],
+      "assistants": [
+        "RAGFlow助手"
+      ],
+      "errors": [],
+      "tokens_used": 16334,
+      "rate_limited": false,
+      "verdict": {
+        "pass": true,
+        "score": 1.0,
+        "detail": {
+          "tools_seen": [
+            "ragflow聊天助手列表查询工具：get_assistant_list"
+          ],
+          "assistants_seen": [
+            "RAGFlow助手"
+          ],
+          "hit_tool": false,
+          "hit_assistant": true
+        }
+      }
+    },
+    {
+      "id": "route-04-markdown-gen",
+      "category": "routing",
+      "query": "根据查到的库存数据，生成一份 Markdown 格式的库存周报。",
+      "started_at": "2026-09-06T09:55:12.542085",
+      "result": "库存周报的 Markdown 文件已成功生成并保存在您指定的工作目录中。本周报涵盖了从数据库中提取的药品库存信息，包括药品名称、当前库存数量、最低库存警戒线（由于数据库中此字段信息不完整，所有药品默认为0）以及最后一次补货的日期。为了保证药品库存充足，请根据具体需求定期检查存货情况，必要时及时进行补货。\n\n如还有其他需求或需要进一步的分析，请随时告知。",
+      "tools": [
+        "数据库表名查询工具：list_sql_tables",
+        "数据库表数据查询工具：get_table_data",
+        "数据库表数据查询工具：get_table_data",
+        "数据库表数据查询工具：execute_sql_query",
+        "数据库表数据查询工具：execute_sql_query",
+        "Markdown文档生成工具"
+      ],
+      "assistants": [
+        "数据库查询助手"
+      ],
+      "errors": [],
+      "tokens_used": 26972,
+      "rate_limited": false,
+      "verdict": {
+        "pass": true,
+        "score": 1.0,
+        "detail": {
+          "tools_seen": [
+            "数据库表名查询工具：list_sql_tables",
+            "数据库表数据查询工具：get_table_data",
+            "数据库表数据查询工具：get_table_data",
+            "数据库表数据查询工具：execute_sql_query",
+            "数据库表数据查询工具：execute_sql_query",
+            "Markdown文档生成工具"
+          ],
+          "assistants_seen": [
+            "数据库查询助手"
+          ],
+          "hit_tool": true,
+          "hit_assistant": false
+        }
+      }
+    },
+    {
+      "id": "route-05-negative-routing",
+      "category": "routing",
+      "query": "不要查数据库，只用网络搜索最新的奥司他韦耐药性研究进展。",
+      "started_at": "2026-09-06T09:57:12.221159",
+      "result": "根据网络搜索助手提供的资料，最新的奥司他韦耐药性研究进展可以概括为以下几点：\n\n1. 细胞培养试验和临床试验显示了奥司他韦的耐药性的现象，耐药病毒含有特定的病毒神经氨酸酶和血凝素蛋白氨基酸突变。对于这类病毒的检测和进一步分析对理解和解决耐药性问题有着重要的意义。\n\n2. 有研究显示抗病毒新药法匹拉韦对耐药奥司他韦株具有一定的活性。该药物对几种季节性流感病毒奥司他韦耐药株都显示出了良好的抗病毒效果，并未表现出明显的交叉耐药性。\n\n3. 儿童尤其小于5岁的儿童和感染A型H1N1流感的患者中出现奥司他韦耐药风险较高。研究还提到巴洛沙韦耐药性和治疗失败的一些情况。\n\n4. 行业分析报告显示成人使用奥司他韦产生耐药性的概率约为1%。此外，对于奥司他韦耐药病毒株的新型抗流感药物研发已取得了显著进步。\n\n5. 新型药物Baloxavir是一种代表性的治疗药物，在香港及其他地区已获批准上市，表明它对奥司他韦耐药株有着不错的疗效。\n\n综上所述，研究界正逐步探索减轻奥司他韦耐药性风险的新策略。未来还需开发更好的抗病毒药物，以解决耐药性问题。希望以上信息对您了解奥司他韦耐药性当前的研究进展有所帮助。",
+      "tools": [
+        "网络搜索工具"
+      ],
+      "assistants": [
+        "网络搜索助手"
+      ],
+      "errors": [],
+      "tokens_used": 17193,
+      "rate_limited": false,
+      "verdict": {
+        "pass": true,
+        "score": 1.0,
+        "detail": {
+          "tools_seen": [
+            "网络搜索工具"
+          ],
+          "assistants_seen": [
+            "网络搜索助手"
+          ],
+          "hit_tool": false,
+          "hit_assistant": true
+        }
+      }
+    },
+    {
+      "id": "route-06-db-web-combo",
+      "category": "routing",
+      "query": "先查数据库里达格列净的库存和销售情况，再用网络补充它的临床研究新进展。",
+      "started_at": "2026-09-06T10:07:18.048647",
+      "result": null,
+      "tools": [
+        "网络搜索工具",
+        "数据库表名查询工具：list_sql_tables",
+        "数据库表数据查询工具：get_table_data",
+        "数据库表数据查询工具：get_table_data",
+        "数据库表数据查询工具：get_table_data",
+        "数据库表数据查询工具：execute_sql_query"
+      ],
+      "assistants": [
+        "数据库查询助手",
+        "网络搜索助手"
+      ],
+      "errors": [
+        "执行主智能发生异常信息：HTTPSConnectionPool(host='api.tavily.com', port=443): Max retries exceeded with url: /search (Caused by ProxyError('Unable to connect to proxy', RemoteDisconnected('Remote end closed connection without response')))"
+      ],
+      "tokens_used": 0,
+      "rate_limited": true,
+      "verdict": {
+        "pass": true,
+        "score": 1.0,
+        "detail": {
+          "tools_seen": [
+            "网络搜索工具",
+            "数据库表名查询工具：list_sql_tables",
+            "数据库表数据查询工具：get_table_data",
+            "数据库表数据查询工具：get_table_data",
+            "数据库表数据查询工具：get_table_data",
+            "数据库表数据查询工具：execute_sql_query"
+          ],
+          "assistants_seen": [
+            "数据库查询助手",
+            "网络搜索助手"
+          ],
+          "hit_tool": false,
+          "hit_assistant": true
+        }
+      },
+      "contaminated": true,
+      "contamination_reason": "external_search_down"
+    }
+  ],
+  "passed": 6,
+  "pass_rate": 1.0,
+  "total_tokens": 93964,
+  "rejudged_at": "2026-09-06T10:31:53.752869",
+  "note": "污染用例标记 contaminated（429 限流/超时/Tavily 搜索故障未获公平评测）。"
+}
