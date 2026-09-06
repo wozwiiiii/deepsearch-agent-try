@@ -163,6 +163,17 @@ RAGFLOW_API_KEY=...
 docker compose -f docker/docker-compose.yaml up -d
 ```
 
+> 该命令会同时启动 MySQL、Postgres（task 表）与 Redis（队列）三个服务。
+
+**可选：任务队列模式**——默认 `TASK_QUEUE_MODE=inline`（任务在 API 进程内执行，零额外依赖）。设置 `TASK_QUEUE_MODE=redis` 后任务由独立 ARQ worker 执行（服务重启不丢、可水平扩容），需额外启动 worker：
+
+```bash
+.venv/Scripts/python -m arq app.queue.worker.WorkerSettings   # Windows
+arq app.queue.worker.WorkerSettings                            # Linux/macOS
+```
+
+详见 `PRODUCTION_NOTES.md` 与 `docs/TASK_QUEUE_DESIGN.md`。
+
 ### 5. 启动后端
 
 ```bash

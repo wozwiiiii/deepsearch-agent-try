@@ -1,11 +1,12 @@
 # deepsearch-agents Code Wiki
 
-> **生成基准（2026-09-05 更新）**：`main` 分支，HEAD `4aebb83`，154 个测试全绿（实测 28.80 秒）。
+> **生成基准（2026-09-06 更新）**：`main` 分支，HEAD `3dcddcf`，262 个测试全绿（真容器实测；无 PG/Redis 环境为 243 passed + 19 skipped）。
 >
 > **⚠️ 分支表述更正**：本文件此前版本写"生成基准 `production-hardening` 分支（2026-08-30，HEAD `2a0db27`）"——**该分支不存在**（`git branch -a` 仅 `main`）。全部增量均在 `main` 上，**查看增量请用 `git diff df6d52e..HEAD`**（`df6d52e` 为上游 didilili 最后一笔，2026-05-18），`git diff main` 恒为空。
 >
-> 规模实测：后端 `app/` 28 个 `.py` / 3,351 行；`tests/` 154 用例；`eval/` 45 条；`frontend/src/` 19 文件 / 2,140 行。
+> 规模实测：后端 `app/` 34 个 `.py`；`tests/` 262 用例；`eval/` 45 条 + judge/compare/rejudge 工具链；`frontend/src/` 19 文件。
 > 本文档面向需要快速理解代码结构的开发者与评审者。改造动机的"原问题→修复→验证"明细见 [PRODUCTION_NOTES.md](PRODUCTION_NOTES.md)；本文聚焦**现状结构 + 设计决策的为什么**，所有代码片段摘自当前分支真实文件。
+> **2026-09 增量**：评测驱动修复闭环（守卫/预算/意图硬约束，§6.2）与任务出进程（P0-2 阶段 1，§5.6）为本 Wiki 最新两批结构性改动。
 
 ---
 
@@ -46,9 +47,10 @@
 | Agent 框架 | DeepAgents 0.5.7 + LangGraph 1.1.10 + LangChain 1.2.17 |
 | LLM | OpenAI 兼容协议（`init_chat_model`，实际为 DashScope qwen-max） |
 | 后端 | FastAPI + uvicorn，slowapi（限流），aiosqlite（事件库/checkpointer） |
+| 任务队列 | **ARQ（Redis）+ psycopg3（Postgres task 表）**——`TASK_QUEUE_MODE=inline|redis` 双模式，默认 inline 零依赖（P0-2 阶段 1） |
 | 工具客户端 | tavily-python、mysql-connector-python、ragflow-sdk、pypdf/python-docx/openpyxl |
 | 前端 | React 19 + TypeScript + Vite + Ant Design 5 + pnpm |
-| 数据 | MySQL 8.4（Docker；教学数据：药品 50 / 库存 150 / 销售记录 100） |
+| 数据 | MySQL 8.4（Docker；教学数据：药品 50 / 库存 150 / 销售记录 100）+ Postgres 16（task 表/checkpointer，redis 模式）+ Redis 7（队列） |
 
 ---
 
@@ -407,18 +409,20 @@ async with _agent_init_lock:
 ```
 deepsearch-agents/
 ├── app/
-│   ├── api/                    # ★ 接口层：server / auth / monitor / event_store / context
+│   ├── api/                    # ★ 接口层：server / auth / monitor / event_store / context / task_service
 │   ├── agent/                  # ★ main_agent + llm + prompts + subagents/(三个配置)
+│   │                            #   + final_answer_guard（早停守卫）+ token_budget（会话级预算）
+│   ├── queue/                  # ★ 任务出进程（P0-2 阶段 1）：task_store（PG DAO）+ worker（ARQ）
 │   ├── prompt/prompts.yml      # 全部提示词（不硬编码）
-│   ├── tools/                  # ★ 六个 LangChain @tool 模块
+│   ├── tools/                  # ★ 七个 LangChain @tool 模块 + file_intent_guard（文件生成意图硬约束）
 │   ├── ragflow/                # RAGFlow 连接配置
 │   └── utils/                  # path_utils（收容校验）/ word_converter
 ├── frontend/                   # React（见 §9）
-├── tests/                      # 154 个测试（见 §13）
-├── eval/                       # 评测集 cases/judge/runner（45 条，2026-09-05 自 20 条扩量）
-├── docker/                     # MySQL 8.4 compose + 初始化 SQL + 只读账号脚本
+├── tests/                      # 262 个测试（见 §13；无 PG/Redis 环境自动 skip 集成用例）
+├── eval/                       # 评测集 cases/judge/runner + rejudge（污染标记/离线重判）+ compare（成对对比）
+├── docker/                     # compose：MySQL 8.4 + Postgres 16 + Redis 7（P0-2 起）+ 初始化 SQL
 ├── examples/                   # DeepAgents 框架 15 个教学脚本（非运行时依赖）
-├── docs/                       # PRODUCTION_NOTES / 设计稿 / WORK_STATUS / 本 Wiki
+├── docs/                       # PRODUCTION_NOTES / 设计稿 / 评测报告系列 / WORK_STATUS / 本 Wiki
 └── pyproject.toml              # uv 管理（Python 3.12 锁定）
 ```
 
@@ -465,6 +469,24 @@ deepsearch-agents/
 
 `ContextVar` 保存 `session_dir` 与 `thread_id`（复合键）；`run_deep_agent` 开始 set、finally reset。工具经 `get_session_context()` 免层层传参。边界：隐式依赖，工具需容忍 None（脚本调试场景）。
 
+### 5.6 [task_service.py](../app/api/task_service.py) + [app/queue/](../app/queue/) — 任务出进程（P0-2 阶段 1）
+
+**双模式开关** `TASK_QUEUE_MODE`（默认 inline）：
+
+| | inline（默认） | redis |
+|---|---|---|
+| 任务执行 | 进程内 `asyncio.create_task`（原逻辑，迁入本模块） | 写 task 表 + ARQ `enqueue_job`，独立 worker 进程执行 |
+| 取消 | dict + `task.cancel()`（1s 等待 → cancelled/cancelling） | `UPDATE tasks SET status='cancelled'`，worker 2s 轮询中止（原 running → `cancelling`） |
+| checkpointer | AsyncSqliteSaver（不变） | AsyncPostgresSaver（接口不变，沿用 `_checkpoint_saver_ctx` GC 防护模式） |
+| 依赖 | 无（评测/开发零基础设施） | Redis + Postgres 容器 |
+
+**[task_store.py](../app/queue/task_store.py)**：tasks 表 DAO（psycopg 异步池，惰性初始化）。状态机 `pending → running → done/failed`，`pending/running → cancelled`；三层守卫——① mark_finished 的 `WHERE status IN ('pending','running')`（终态不可覆盖）；② **worker_id 代际守卫**（收尾 WHERE 追加 worker_id，迟到的旧代际 worker 无法污染重提交后的新行——QA Round 1 发现的 P0-1）；③ cancel_task 用 SELECT FOR UPDATE 区分原状态。`submit_count+1` 递增生成 `job_id=f"task:{task_key}:{submit_count}"`——ARQ 以 `_job_id` 做 in-flight 去重，固定 id 会让旧 job 吞掉新提交（任务永远 pending）。
+
+**[worker.py](../app/queue/worker.py)**：`run_task(ctx, task_key)` 只收 task_key，参数执行时从表读（单一事实源）；`run_deep_agent` 自建全部 ContextVar，worker 零初始化；取消/替换观察协程（2s 轮询代际变化，旧 run 秒级中止，cancel 后 10s 宽限等清理分支跑完）；`job_timeout=660s` > 内部 600s 硬超时（保证 Agent 自己的超时收尾先生效）；`max_tries=1` 不自动重试（LLM 花费真实、副作用非幂等，失败落表可重提）；`on_startup` 重拾 unfinished（running 先 reset_running 再入队——P1-1 修复）。
+
+**事件链路（阶段 1 取舍）**：worker 内 monitor 事件自动落共享 SQLite event_store（同机目录）；WS 连接挂 1s 轮询桥推差量（`_poll_event_store`，monitor 零改动）——阶段 2 换 Redis pub/sub 时此轮询任务是唯一替换点。
+
+
 ---
 
 ## 6. 模块详解：agent 层
@@ -495,7 +517,15 @@ _main_agent = create_deep_agent(
 
 `_consume_agent_stream`（token 熔断见 §3.7）同时负责：解析 `task` 工具调用上报子智能体路由、捕获最终文本上报结果。
 
-### 6.2 subagents/ — 字典式子智能体
+### 6.2 治理模块（2026-09 增量：评测驱动产出）
+
+三个由评测缺陷直接驱动的自研治理模块（详见 EVAL 系列报告）：
+
+- **[final_answer_guard.py](../app/agent/final_answer_guard.py) — 最终回答守卫**：拦截两类早停（90+ 次评测运行实证）——①纯过渡语（"我将启动××进行查询"收尾，短+无数字+过渡语短语三条件 AND 高精度判定）；②空输出（content 为空、零工具、~8.2K tokens，n=2）。触发即向同 thread_id 会话注入纠偏消息强制续跑，单任务上限 1 次防死循环。**实战 9 触发 9 救回**。触发判定入口 `guard_trigger_reason(final_reply, ended_with_tool_calls)`——工具片段截断不介入（防续跑重复执行工具）。
+- **[token_budget.py](../app/agent/token_budget.py) — 会话级 token 预算**：run 级（150 万/任务）之外的跨任务累计熔断（默认 450 万=3×run 级，`MODEL_TOKEN_SESSION_LIMIT` 可配），超限 RuntimeError 与 run 级同路径上报。边界：进程内计数（P0-2 多副本后需迁共享存储，代码注释已声明）。
+- **[file_intent_guard.py](../app/tools/file_intent_guard.py) — 文件生成意图硬约束**（tools 层）：`generate_markdown`/`convert_md_to_pdf` 执行前校验用户原始消息是否含明确文件意图（动作词 AND 文件词双条件，ContextVar 传入原始 task_query——不能存拼接消息，path_instruction 含"新生成文件"字样会致守卫全放行失效）；未要求则拒绝并返回引导信息。上下文缺失 fail-open。QA 全量扫描 45 条评测 query 零误拒。
+
+### 6.3 subagents/ — 字典式子智能体
 
 三个配置模块结构相同（name/description/system_prompt 来自 `prompts.yml` + 各自 tools 列表）：
 

@@ -66,6 +66,21 @@ cd frontend && pnpm install && pnpm dev
 
 前端默认 `http://localhost:5173`，它会连后端 `:8000`。
 
+### 4b.（可选）任务队列模式（P0-2）
+
+默认 `TASK_QUEUE_MODE=inline`：任务在 API 进程内执行，本节全部可跳过。设置 `TASK_QUEUE_MODE=redis` 后需要：
+
+```bash
+cd docker && docker compose up -d postgres redis     # PG(5433) + Redis(6379)
+.venv/Scripts/python -m arq app.queue.worker.WorkerSettings   # 独立 worker 进程
+```
+
+- 提交的任务落在 Postgres `tasks` 表（pending→running→done/failed），重启 worker 自动重拾未完成任务；
+- 取消接口改查表：运行中任务返回 `cancelling`（worker ≤3s 内真正停止）；
+- 新增状态查询：`GET /api/task/{thread_id}/status`；
+- worker 内执行的事件经共享 event_store 落库，前端 WS 每 1s 轮询补差量（实时性略降，阶段 2 换 Redis pub/sub）。
+- Windows 注意：API 进程跑 redis 模式需自选 selector 事件循环（`asyncio.set_event_loop_policy(asyncio.WindowsSelectorEventLoopPolicy())`），否则 psycopg 异步无法建连——详见 PRODUCTION_NOTES。
+
 ---
 
 ## 二、跑测试（不需要任何真实服务，6 秒）

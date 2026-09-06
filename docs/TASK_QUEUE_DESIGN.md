@@ -1,12 +1,16 @@
 # P0-2 任务队列与并发治理设计方案
 
-> 状态：**设计稿**（未实现）。当前最高优先级的上线阻塞项。
+> 状态：**阶段 1 已实现**（2026-09-06，提交 `33761bc`）。阶段 2（事件广播）待做。
 >
-> **2026-09-05 复核**：状态未变，**实现仍是一行未动**——代码中仍是 `asyncio.create_task`（`server.py:348`）跑在 Web 进程内。本设计稿的三阶段划分（会话亲和 → 状态出进程 → 事件广播）与选型论证（ARQ 基于 Redis、原生 async，Celery 同步模型会让 async Agent 退化）经复核**依然成立，无需修改**。
+> **2026-09-06 实现落地**：阶段 1（任务状态出进程）已交付并经 QA 两轮回归（Round 1 判返工两项缺陷，Round 2 真库探针重放验证闭环）。实际落地与本稿的差异（以代码为准）：
+> - **`TASK_QUEUE_MODE=inline|redis` 双模式降级开关**（本稿未写）：默认 inline = 原进程内直跑（存量测试/评测/开发零依赖零变化）；redis = 本稿阶段 1 全链路。实现于 `app/api/task_service.py`。
+> - **task 表增加 `submit_count`/`job_id` 列**（本稿未覆盖的坑）：ARQ 用 `_job_id` 做 in-flight 去重，固定 task_key 会导致"旧 job 吞掉新提交、任务永远 pending"；每次提交 `submit_count+1` 并以 `f"task:{task_key}:{submit_count}"` 重建 job_id，重拾逻辑确定性重建同 id。
+> - **worker 代际守卫**（QA Round 1 发现 P0-1 后补强）：mark_finished/cancel 收尾 WHERE 携带 worker_id——迟到的旧代际 worker 无法污染新提交的行；`_watch_cancellation` 升级为取消/替换观察协程（行回 pending / worker_id 换人 / 终态被他方写入 → 中止旧 run）。
+> - **崩溃恢复**：recover_unfinished 对 running 行先 `reset_running`（清 worker_id/started_at）再入队（QA Round 1 发现 P1-1：重入队后被 run_task 的 pending 检查 skip，已修）。
+> - **WS 事件轮询桥**：worker 事件经共享 event_store 落库，API 进程 WS 连接每 1s `read_after` 推差量（monitor.py 零改动）——本稿阶段 2 换 Redis pub/sub 时，此轮询任务是唯一替换点。
+> - 启动方式见 `PRODUCTION_NOTES.md`（`arq app.queue.worker.WorkerSettings`）；测试 262 个（真容器全量）。
 >
-> **阻塞条件**：需本地起 Redis（+ Postgres）。这不是设计问题，是执行资源问题。
-> **优先级提示**：若目标是求职而非上线，跑评测基线（`WORK_STATUS.md` 第六节）的性价比高于本项——本项投入 4–6 天只能证明"工程能力"，而基线能证明"效果"，后者目前为零。
-> 目标：把"任务全在 API 进程内"改成"任务状态外置 + 执行出进程 + 事件广播"，支撑多副本水平扩容。
+> 阶段 0（会话亲和）：跳过（纯运维配置，无代码价值）。
 
 ## 一、当前架构为什么不能多副本
 
