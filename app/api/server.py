@@ -90,7 +90,9 @@ MAX_QUERY_LENGTH = 10_000
 
 # WS 事件轮询桥的轮询间隔（秒，P0-2 阶段 1）：worker 进程执行的任务事件经
 # 共享 event_store（events.sqlite3）到达本进程，按此间隔读取差量推给本连接
-EVENT_POLL_SECONDS = float(os.getenv("EVENT_POLL_SECONDS", "1"))
+# 用 or 而非 getenv 第二参数：.env 里 EVENT_POLL_SECONDS= 留空时
+# os.getenv 返回 ""，float("") 会崩（仓库惯例，QA 回归 P2-3）
+EVENT_POLL_SECONDS = float(os.getenv("EVENT_POLL_SECONDS") or "1")
 
 # CORS 允许来源，逗号分隔配置；默认只放行本地 Vite 开发服务器
 CORS_ORIGINS = [
