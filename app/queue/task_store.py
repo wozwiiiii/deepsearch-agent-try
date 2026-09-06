@@ -1,7 +1,7 @@
 """
 任务状态外置存储（P0-2 阶段 1）：Postgres task 表 DAO
 
-设计要点（详见 docs/TASK_QUEUE_DESIGN.md 阶段 1）：
+设计要点（详见 docs/design/TASK_QUEUE_DESIGN.md 阶段 1）：
 1. 任务状态从进程内 active_tasks dict 外置到 Postgres tasks 表，
    取消/状态查询/重拾都不再依赖"提交任务的进程还活着"；
 2. 复合键 {user_id}-{thread_id} 仍是主键（与 active_tasks、WS 路由、

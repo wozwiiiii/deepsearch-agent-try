@@ -172,7 +172,7 @@ docker compose -f docker/docker-compose.yaml up -d
 arq app.queue.worker.WorkerSettings                            # Linux/macOS
 ```
 
-详见 `PRODUCTION_NOTES.md` 与 `docs/TASK_QUEUE_DESIGN.md`。
+详见 `docs/status/PRODUCTION_NOTES.md` 与 `docs/design/TASK_QUEUE_DESIGN.md`。
 
 ### 5. 启动后端
 

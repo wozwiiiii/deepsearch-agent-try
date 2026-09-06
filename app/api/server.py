@@ -5,7 +5,7 @@ FastAPI 接口层与项目闭环入口
 WebSocket 长连接。HTTP 接口只做轻量调度，真正的 DeepAgents 执行放到后台
 任务中；执行进度、工具调用和最终结果由 monitor 按 thread_id 推送给前端。
 
-生产化改造说明（详见 docs/PRODUCTION_NOTES.md）：
+生产化改造说明（详见 docs/status/PRODUCTION_NOTES.md）：
 1. thread_id 统一过白名单校验，杜绝通过会话 ID 拼接出越界目录；
 2. 上传接口增加扩展名白名单、单文件大小上限和文件名清洗，异步分块落盘；
 3. 文件列表/下载不再接受客户端传入的绝对路径，改为按 thread_id 在服务端

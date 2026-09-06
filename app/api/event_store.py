@@ -1,7 +1,7 @@
 """
 监控事件持久化存储（P0-3 事件回放，SQLite 实现）
 
-设计目标（详见 docs/EVENT_REPLAY_DESIGN.md）：
+设计目标（详见 docs/design/EVENT_REPLAY_DESIGN.md）：
 1. monitor 发出的每条事件先落库再推送，事件"发完即丢"改为可回放；
 2. 每条事件携带全局自增 seq，前端据此检测丢件（seq 跳号）并请求差量补发；
 3. WebSocket 重连握手携带 last_seq，服务端只补发 last_seq 之后的事件。

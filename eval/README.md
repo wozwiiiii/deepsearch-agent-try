@@ -84,7 +84,7 @@ python -m eval.runner --category web --runs 3 --out eval-report.json
 - 生成质量（web/multi 的有据性、完整性）
 
 **不衡量**：
-- 速度/成本（需要另行埋点 token 与耗时，见 PRODUCTION_NOTES P1-4）
+- 速度/成本（需要另行埋点 token 与耗时，见 docs/status/PRODUCTION_NOTES P1-4）
 - 鲁棒性（边界输入、对抗提示注入——需要专门的对抗集）
 - 长会话记忆（需要多轮用例，最小版未覆盖）
 

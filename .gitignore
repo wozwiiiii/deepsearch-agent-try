@@ -72,3 +72,10 @@ Thumbs.db
 
 # git 修复期证据备份（对象库损毁后的 reflog/config 存档）
 git-rescue-20260905/
+
+# 本地文档索引（按用户要求不推送，2026-09-06）
+docs/INDEX.md
+
+# 技术文档仅本地保存（2026-09-06 用户指定：docs 仅 knowledge_base/images 进远端）
+docs/*.md
+docs/**/*.md

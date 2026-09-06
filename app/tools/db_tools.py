@@ -26,7 +26,7 @@ load_dotenv()
 # 防护分两层：
 # 1. 工具层：assert_readonly_sql 只放行 SELECT/SHOW/DESCRIBE/EXPLAIN 单条语句；
 # 2. 账号层：部署时为 Agent 单独创建仅 SELECT 权限的 MySQL 账号（见
-#    docs/PRODUCTION_NOTES.md），工具层被绕过时仍有数据库权限兜底。
+#    docs/status/PRODUCTION_NOTES.md），工具层被绕过时仍有数据库权限兜底。
 # ---------------------------------------------------------------------------
 
 # 去掉 -- 注释、# 注释和 /* */ 块注释后再做语句校验，防止用注释伪装语句开头

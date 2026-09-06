@@ -1,7 +1,7 @@
 """
 ARQ worker：把 run_deep_agent 的执行搬出 API 进程（P0-2 阶段 1）
 
-启动命令（详见 docs/PRODUCTION_NOTES.md）：
+启动命令（详见 docs/status/PRODUCTION_NOTES.md）：
     arq app.queue.worker.WorkerSettings
 
 设计要点：
