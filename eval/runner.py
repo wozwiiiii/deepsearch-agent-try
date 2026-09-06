@@ -26,6 +26,7 @@
 import argparse
 import asyncio
 import json
+import re
 import sys
 import traceback
 import uuid
@@ -93,9 +94,16 @@ def rate_limit_backoff_seconds(base_wait: float, attempt: int) -> float:
     return base_wait * (2 ** attempt)
 
 
+_RATE_LIMIT_429_RE = re.compile(r"(?<!\d)429(?!\d)")
+
+
 def has_rate_limit_error(errors: list) -> bool:
-    """捕获的错误列表里是否出现 429（TPM 超限）"""
-    return any("429" in str(e) for e in errors)
+    """捕获的错误列表里是否出现独立的 429（TPM 超限）
+
+    用数字边界匹配（如 "Error code: 429"），避免 "1429"/"4290" 这类
+    含 429 子串的无关数字误判触发限流退避。
+    """
+    return any(_RATE_LIMIT_429_RE.search(str(e)) for e in errors)
 
 
 # ---------------------------------------------------------------------------

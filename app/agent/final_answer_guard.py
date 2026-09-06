@@ -1,10 +1,13 @@
 """
-最终回答守卫：拦截"纯过渡语早停"（P1 评测修复）
+最终回答守卫：拦截"纯过渡语早停"与"空输出早停"（P1 评测修复）
 
 背景：主智能体的 ReAct 循环里，模型输出"不带工具调用的纯文本"即宣告回合
-结束。评测两轮全量跑批（45 用例 × 2 轮 = 90 次运行）中出现 5 次同一签名的
-早停：模型在单次调用后以"我将启动数据库查询助手进行查询。""我将等待其
-结果。"这类纯过渡语收尾，用户只收到一句没有任何实质内容的空话。
+结束。评测三轮全量跑批（45 用例 × 3 轮 = 135 次运行）中出现两类早停签名：
+1. 纯过渡语（基线/v2 共 5 次）：模型在单次调用后以"我将启动数据库查询
+   助手进行查询。""我将等待其结果。"这类纯过渡语收尾，用户只收到一句
+   没有任何实质内容的空话；
+2. 空输出（v3 的 route-02/multi-07，n=2）：模型最终消息 content 为空，
+   用户收到空回答、零工具调用、~8.2K tokens、无任何错误。
 
 本模块提供守卫的判据与续跑提示词：
 - is_pure_transition_reply 判定最终回答是否为"纯过渡语"。判据刻意保守
@@ -13,11 +16,14 @@
     2. 不含任何数字——"数据库里共有 50 种药品"这类一句话实质答案必然
        携带数据，直接放行；
     3. 含未来时/进行时过渡语短语（我将/让我/正在/等待/即将/请稍候…）。
+- guard_trigger_reason 是守卫触发总判定入口，覆盖上述两类变体
+  （空输出无需特征匹配——正常 ReAct 结束必经过文本轮，回合结束却无
+  任何文本产出本身就是异常）。
 - FINAL_ANSWER_GUARD_PROMPT 是守卫触发后注入会话的纠偏消息，要求模型
   要么真实调用工具/子智能体，要么基于已有结果给出实质回答。
 
 触发频率与循环结构见 main_agent._consume_agent_stream：守卫在单个任务内
-最多触发 FINAL_ANSWER_GUARD_MAX 次，续跑后仍输出过渡语则放行结束
+最多触发 FINAL_ANSWER_GUARD_MAX 次，续跑后仍命中早停特征则放行结束
 （防死循环）。
 
 调用上限边界（如实说明）：ModelCallLimitMiddleware 的 run 级上限
@@ -88,3 +94,32 @@ def is_pure_transition_reply(text: object) -> bool:
         return False
 
     return any(phrase in reply for phrase in TRANSITIONAL_PHRASES)
+
+
+def guard_trigger_reason(final_reply: object, ended_with_tool_calls: bool = False) -> str | None:
+    """
+    守卫触发总判定：回合结束时应否强制续跑；返回触发原因，None 表示放行
+
+    :param final_reply: 回合结束时的最终回答候选（无任何文本产出时为 None）
+    :param ended_with_tool_calls: 回合是否以带 tool_calls 的模型消息收尾。
+        正常 ReAct 图不会在这种状态下 END（END 条件即"无工具调用的文本输出"），
+        astream 以工具片段结束属流异常截断——图仍处于推进中间态，续跑可能
+        重复执行工具，故守卫不介入（与既有测试 test_tool_call_only_end_
+        does_not_trigger_guard 的设计意图一致）。
+
+    覆盖两个实证的早停变体（见 EVAL_COMPARISON_V3_2026-09-06.md）：
+    1. "transition_only"——纯过渡语（v3 实战 2 次触发 2 次救回）；
+    2. "empty_output"——空输出（route-02/multi-07，n=2）：模型文本轮
+       content 为空、无 tool_calls，用户收到空回答。回合结束时既无文本
+       产出、也不在工具调用中间态，即为异常早停。
+    """
+    if final_reply is None or (
+        isinstance(final_reply, str) and not final_reply.strip()
+    ):
+        # 无文本产出（None 或空白串）
+        if ended_with_tool_calls:
+            return None  # 工具片段截断：中间态，不介入
+        return "empty_output"
+    if is_pure_transition_reply(final_reply):
+        return "transition_only"
+    return None

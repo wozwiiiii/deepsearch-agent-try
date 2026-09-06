@@ -27,7 +27,7 @@ from langgraph.checkpoint.sqlite.aio import AsyncSqliteSaver
 from app.agent.final_answer_guard import (
     FINAL_ANSWER_GUARD_MAX,
     FINAL_ANSWER_GUARD_PROMPT,
-    is_pure_transition_reply,
+    guard_trigger_reason,
 )
 from app.agent.llm import model
 from app.agent.prompts import main_agent_content
@@ -183,12 +183,14 @@ async def _consume_agent_stream(agent_factory, message: str, config: dict) -> No
     :param agent_factory: 返回主智能体实例的协程函数（_get_agent）
 
     最终回答守卫（P1 早停修复）：ReAct 循环里模型输出"无工具调用的纯文本"
-    即宣告回合结束。评测 90 次运行中出现 5 次模型以"我将启动××进行查询。"
-    这类纯过渡语收尾的早停，用户只收到一句空话。守卫在每轮回合自然结束后
-    检查最终回答：命中"短 + 无数字 + 过渡语"的高精度特征时，向同一会话
-    注入纠偏消息强制续跑；守卫最多触发 FINAL_ANSWER_GUARD_MAX 次，续跑后
-    仍是过渡语则放行结束（防死循环）。判据实现在
-    app/agent/final_answer_guard.py。
+    即宣告回合结束。评测 135 次运行中出现两类早停：①5 次模型以"我将启动
+    ××进行查询。"这类纯过渡语收尾，用户只收到一句空话；②2 次空输出
+    （route-02/multi-07：最终消息 content 为空、零工具、~8.2K tokens）。
+    守卫在每轮回合自然结束后检查最终回答：纯过渡语命中"短 + 无数字 +
+    过渡语"的高精度特征、或回合结束却无任何文本产出（空输出）时，向同一
+    会话注入纠偏消息强制续跑；守卫最多触发 FINAL_ANSWER_GUARD_MAX 次，
+    续跑后仍命中则放行结束（防死循环）。判据实现在
+    app/agent/final_answer_guard.py（入口 guard_trigger_reason）。
 
     调用上限边界（如实说明）：守卫续跑是第二次独立 astream，而
     ModelCallLimitMiddleware 的 run 级上限（MODEL_RUN_LIMIT=80）以
@@ -210,6 +212,9 @@ async def _consume_agent_stream(agent_factory, message: str, config: dict) -> No
     guard_remaining = FINAL_ANSWER_GUARD_MAX
     # 首轮输入原始任务问题；守卫续跑时替换为纠偏消息（同 thread_id 续会话）
     agent_input: dict = {"messages": [{"role": "user", "content": message}]}
+    # 最后一条模型消息是否带 tool_calls：区分"工具片段截断"（不介入）与
+    # "空输出早停"（触发守卫）——两者在回合结束时都表现为无文本产出
+    last_model_had_tool_calls = False
 
     while True:
         # 本轮"无工具调用的模型文本"= 回合结束时的最终回答候选；
@@ -255,6 +260,7 @@ async def _consume_agent_stream(agent_factory, message: str, config: dict) -> No
                                     )
                             # 本轮仍在推进，不是收尾文本
                             final_reply = None
+                            last_model_had_tool_calls = True
                         elif last_msg.content:
                             # 模型没有继续调用工具时，最新文本内容就是本轮可反馈给前端的结果
                             logger.info(
@@ -263,17 +269,25 @@ async def _consume_agent_stream(agent_factory, message: str, config: dict) -> No
                             monitor.report_task_result(last_msg.content)
                             # 记录为最终回答候选，供回合结束后的守卫检查
                             final_reply = last_msg.content
+                            last_model_had_tool_calls = False
+                        else:
+                            # 模型文本轮但 content 为空：空输出早停候选
+                            # （v3 route-02/multi-07 实证签名：result 空、
+                            # 零工具、~8.2K tokens），交由守卫总判定处理
+                            final_reply = None
+                            last_model_had_tool_calls = False
 
         # 回合自然结束后执行最终回答守卫（判据与续跑提示词见 final_answer_guard）
-        if (
-            guard_remaining > 0
-            and final_reply is not None
-            and is_pure_transition_reply(final_reply)
-        ):
+        # 覆盖两类早停变体：纯过渡语（final_reply 命中特征）与空输出
+        # （无文本产出且非工具片段截断——v3 的 route-02/multi-07 实证签名）。
+        # 触发原因如实记录日志留痕。
+        trigger_reason = guard_trigger_reason(final_reply, last_model_had_tool_calls)
+        if guard_remaining > 0 and trigger_reason:
             guard_remaining -= 1
             logger.warning(
-                "[MainAgent] 检测到纯过渡语早停"
-                f"（{str(final_reply)[:80]}），触发最终回答守卫强制续跑"
+                f"[MainAgent] 检测到早停（{trigger_reason}）"
+                f"（{str(final_reply)[:80] if final_reply is not None else '<空输出>'}），"
+                "触发最终回答守卫强制续跑"
             )
             agent_input = {
                 "messages": [{"role": "user", "content": FINAL_ANSWER_GUARD_PROMPT}]

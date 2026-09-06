@@ -229,3 +229,74 @@ def test_tool_call_only_end_does_not_trigger_guard(monkeypatch):
         [[_model_chunk(tool_calls=_task_tool_call())]],
     )
     assert len(agent.inputs) == 1
+
+
+# ---------------------------------------------------------------------------
+# 空输出早停变体（v3 route-02/multi-07 实证签名，n=2）
+# ---------------------------------------------------------------------------
+
+def test_empty_output_triggers_guard_then_real_answer(monkeypatch):
+    """空 content 文本轮（无 tool_calls）→ 守卫触发续跑 → 实质回答
+
+    对应真实签名：result 为空、零工具、~8.2K tokens、无错误。
+    """
+    agent, stub_monitor, tokens = _run_stream(
+        monkeypatch,
+        [
+            [_model_chunk(content="", total_tokens=8200)],
+            [_model_chunk(content="奥司他韦通过抑制神经氨酸酶发挥抗病毒作用。")],
+        ],
+    )
+    assert len(agent.inputs) == 2
+    # 续跑轮输入精确等于纠偏提示词
+    assert agent.inputs[1]["messages"][0]["content"] == guard_mod.FINAL_ANSWER_GUARD_PROMPT
+    _assert_same_thread(agent)
+    # 实质回答被上报，且 token 跨轮累计
+    assert stub_monitor.results == ["奥司他韦通过抑制神经氨酸酶发挥抗病毒作用。"]
+    assert tokens == 8200 + 100
+
+
+def test_empty_output_persists_releases(monkeypatch):
+    """续跑后仍是空输出 → 恰好两轮放行结束（防死循环），无内容上报"""
+    agent, stub_monitor, _ = _run_stream(
+        monkeypatch,
+        [
+            [_model_chunk(content="")],
+            [_model_chunk(content="")],
+        ],
+    )
+    assert len(agent.inputs) == 2
+    _assert_same_thread(agent)
+    assert stub_monitor.results == []
+
+
+def test_tool_chunk_then_empty_text_triggers_guard(monkeypatch):
+    """先派发子智能体（tool_calls 轮）再出现空文本轮 → 空输出守卫触发
+
+    区分关键：最后一条模型消息是无 tool_calls 的空文本（非工具片段截断）。
+    tool_calls 与空文本在真实 ReAct 中同属一次 astream 的先后 chunk。
+    """
+    agent, _, _ = _run_stream(
+        monkeypatch,
+        [
+            [
+                _model_chunk(tool_calls=_task_tool_call()),
+                _model_chunk(content=""),
+            ],
+            [_model_chunk(content="库存数据如下：阿莫西林胶囊 12000 盒。")],
+        ],
+    )
+    assert len(agent.inputs) == 2
+    _assert_same_thread(agent)
+
+
+def test_guard_trigger_reason_pure_function():
+    """guard_trigger_reason 四分支纯函数断言"""
+    assert guard_mod.guard_trigger_reason(None, False) == "empty_output"
+    assert guard_mod.guard_trigger_reason(None, True) is None  # 工具片段截断不介入
+    assert (
+        guard_mod.guard_trigger_reason("我将启动数据库查询助手进行查询。", False)
+        == "transition_only"
+    )
+    assert guard_mod.guard_trigger_reason("数据库里共有 50 种药品。", False) is None
+    assert guard_mod.guard_trigger_reason("", False) == "empty_output"  # 空串视为无产出

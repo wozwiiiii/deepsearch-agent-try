@@ -262,3 +262,11 @@ def test_run_all_cooldown_skipped_after_last_case(monkeypatch):
 
     assert exit_code == 0
     assert waits == []
+
+
+def test_has_rate_limit_error_digit_boundary():
+    """数字边界：'1429'/'4290' 等含 429 子串的无关数字不触发限流判定"""
+    assert not runner_mod.has_rate_limit_error(["错误码 1429 发生"])
+    assert not runner_mod.has_rate_limit_error(["配额 4290 条"])
+    assert runner_mod.has_rate_limit_error(["Error code: 429 - TPM limit"])
+    assert runner_mod.has_rate_limit_error(["...code=429..."])
