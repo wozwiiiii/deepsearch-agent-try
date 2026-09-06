@@ -33,6 +33,11 @@ tavily-python==0.7.24       # 联网搜索 API
 ragflow-sdk>=0.1.0          # 知识库 SDK
 requests>=2.31.0            # HTTP 请求库
 
+# --- 任务队列（P0-2 阶段 1：TASK_QUEUE_MODE=redis 时启用） ---
+arq>=0.26                      # Redis 异步任务队列（Agent 执行出进程）
+langgraph-checkpoint-postgres>=2.0.0  # AsyncPostgresSaver checkpointer（多副本共享会话状态）
+psycopg[binary,pool]>=3.1      # Postgres 异步驱动与连接池（task 表 + checkpointer）
+
 # --- 基础工具 (Utilities) ---
 PyYAML>=6.0                 # YAML 配置文件解析，用于 prompts.py
 pydantic>=2.0.0             # 数据校验

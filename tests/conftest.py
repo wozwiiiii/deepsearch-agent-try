@@ -18,6 +18,9 @@ os.environ.setdefault("TAVILY_API_KEY", "test-key-placeholder")
 # 测试默认显式开启开发模式，保持原有"无需密钥"的用例可运行；
 # 需要 fail-closed 行为的用例在各自文件里 delenv 覆盖。
 os.environ.setdefault("ALLOW_DEV_MODE", "1")
+# 任务队列模式（P0-2 阶段 1）：测试统一走 inline 进程内直跑，
+# 与生产默认一致；redis 分支的用例在各自文件里 monkeypatch 覆盖
+os.environ.setdefault("TASK_QUEUE_MODE", "inline")
 # 限流阈值在 server.py 导入时读取；测试默认放开，限流专项用例单独调小
 os.environ.setdefault("RATE_LIMIT_TASK", "1000/minute")
 os.environ.setdefault("RATE_LIMIT_UPLOAD", "1000/minute")

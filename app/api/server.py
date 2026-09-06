@@ -46,7 +46,6 @@ from slowapi.errors import RateLimitExceeded
 from slowapi.util import get_remote_address
 from starlette.responses import JSONResponse
 
-from app.agent.main_agent import run_deep_agent
 from app.api.auth import (
     Principal,
     authenticate_api_key,
@@ -57,6 +56,8 @@ from app.api.auth import (
 )
 from app.api.event_store import event_store
 from app.api.monitor import manager
+from app.api import task_service
+from app.api.task_service import TaskNotFoundError
 from app.utils.logging_setup import get_logger, setup_logging
 
 logger = get_logger(__name__)
@@ -86,6 +87,10 @@ MAX_UPLOAD_FILES = 20
 
 # 任务文本最大长度，防止异常超长输入直接打满模型上下文
 MAX_QUERY_LENGTH = 10_000
+
+# WS 事件轮询桥的轮询间隔（秒，P0-2 阶段 1）：worker 进程执行的任务事件经
+# 共享 event_store（events.sqlite3）到达本进程，按此间隔读取差量推给本连接
+EVENT_POLL_SECONDS = float(os.getenv("EVENT_POLL_SECONDS", "1"))
 
 # CORS 允许来源，逗号分隔配置；默认只放行本地 Vite 开发服务器
 CORS_ORIGINS = [
@@ -241,7 +246,14 @@ async def lifespan(_app: FastAPI):
             "[Server][错误] 未配置 API_KEYS 且未设置 ALLOW_DEV_MODE=1，"
             "所有业务接口将返回 503。请配置 API_KEYS 后重启。"
         )
-    yield
+
+    # 任务调度初始化（P0-2 阶段 1）：redis 模式下幂等建 tasks 表，inline 为空操作
+    await task_service.startup()
+    try:
+        yield
+    finally:
+        # 释放任务调度层持有的连接（ARQ 连接池 / 任务表连接池）
+        await task_service.shutdown()
 
 
 # 当前文件位于 app/api/server.py，运行时目录统一收敛到 app 目录
@@ -250,8 +262,9 @@ project_root = current_dir.parent
 
 app = FastAPI(title="DeepAgents API", lifespan=lifespan)
 
-# 保存 thread_id -> 后台 Agent 任务，用于同一会话任务替换和主动取消
-active_tasks: dict[str, asyncio.Task] = {}
+# 任务提交/取消/状态查询的调度逻辑已整体收编到 task_service（P0-2 阶段 1）：
+# inline 模式下进程内登记表为 task_service.active_tasks（行为与原 active_tasks
+# dict 完全一致），redis 模式下任务状态外置 Postgres、执行入 ARQ 队列
 
 # output 保存每个会话最终工作区，前端只允许从这里浏览和下载生成文件
 output_dir = project_root / "output"
@@ -292,17 +305,6 @@ class TaskRequest(BaseModel):
     thread_id: str = None
 
 
-def _forget_task(thread_id: str, task: asyncio.Task) -> None:
-    """
-    清理已结束任务的登记关系。
-
-    done_callback 触发时，active_tasks 中可能已经被新任务替换；只有仍是同一个
-    task 时才删除，避免误清理同 thread_id 下刚启动的新任务。
-    """
-    if active_tasks.get(thread_id) is task:
-        active_tasks.pop(thread_id, None)
-
-
 @app.get("/health")
 async def health():
     """健康检查端点，供负载均衡和容器探针使用"""
@@ -333,23 +335,16 @@ async def run_task(
     """
     启动一次 DeepAgents 后台任务（每密钥限 RATE_LIMIT_TASK 次/分钟）。
 
-    HTTP 请求只负责创建后台协程并立即返回，后续执行轨迹、子智能体调用和最终
+    HTTP 请求只负责提交任务并立即返回，后续执行轨迹、子智能体调用和最终
     答案都会由 monitor 通过 `/ws/{thread_id}` 推送给同一会话的前端。
+    调度实现按 TASK_QUEUE_MODE 分流（task_service）：inline 进程内直跑 /
+    redis 写任务表 + 入 ARQ 队列由 worker 进程执行；本层只做参数校验与
+    复合键生成，接口签名不变。
     """
     thread_id = validate_thread_id(body.thread_id or str(uuid.uuid4()))
     task_key = composite_task_key(principal.user_id, thread_id)
 
-    # 同一用户同一 thread_id 只保留一个活跃任务；复合键保证跨租户互不影响
-    old_task = active_tasks.get(task_key)
-    if old_task and not old_task.done():
-        old_task.cancel()
-
-    # create_task 把长耗时 Agent 执行交给事件循环，接口本身不用等待最终结果
-    task = asyncio.create_task(
-        run_deep_agent(body.query, thread_id, principal.user_id)
-    )
-    active_tasks[task_key] = task
-    task.add_done_callback(lambda finished_task: _forget_task(task_key, finished_task))
+    await task_service.submit_task(body.query, task_key, principal.user_id, thread_id)
 
     return {"status": "started", "thread_id": thread_id}
 
@@ -359,31 +354,39 @@ async def cancel_task(thread_id: str, principal: Principal = Depends(require_pri
     """
     取消指定 thread_id 对应的后台 Agent 任务。
 
-    注意：取消会向 asyncio.Task 注入 CancelledError。若底层第三方工具正在执行不可中断
-    的同步阻塞调用，任务可能需要等该调用返回后才会真正结束。
+    inline 模式：向 asyncio.Task 注入 CancelledError，1 秒内响应则返回
+    cancelled，否则返回 cancelling（若底层第三方工具正在执行不可中断的
+    同步阻塞调用，任务可能需要等该调用返回后才会真正结束）。
+    redis 模式：写任务表 status=cancelled，worker 按取消轮询间隔发现后中止，
+    执行中的任务返回 cancelling。
+    两种模式都不存在或已结束时统一 404。
     """
     validate_thread_id(thread_id)
     task_key = composite_task_key(principal.user_id, thread_id)
-    task = active_tasks.get(task_key)
-    if not task or task.done():
-        active_tasks.pop(task_key, None)
+    try:
+        return await task_service.cancel_task(task_key, thread_id)
+    except TaskNotFoundError:
         raise HTTPException(status_code=404, detail="任务不存在或已结束")
 
-    # 先发出取消信号，再短暂等待协程响应；若底层阻塞中，则返回 cancelling 给前端继续展示状态
-    task.cancel()
-    try:
-        await asyncio.wait_for(task, timeout=1.0)
-    except asyncio.CancelledError:
-        _forget_task(task_key, task)
-        return {"status": "cancelled", "thread_id": thread_id}
-    except asyncio.TimeoutError:
-        return {"status": "cancelling", "thread_id": thread_id}
-    except Exception as e:
-        _forget_task(task_key, task)
-        return {"status": "cancelled", "thread_id": thread_id, "message": str(e)}
 
-    _forget_task(task_key, task)
-    return {"status": "cancelled", "thread_id": thread_id}
+@app.get("/api/task/{thread_id}/status")
+async def get_task_status(
+    thread_id: str, principal: Principal = Depends(require_principal)
+):
+    """
+    查询指定 thread_id 的任务状态（P0-2 阶段 1 新增）。
+
+    inline 模式从进程内任务登记表推断（活跃即 running）；redis 模式查任务表
+    （pending/running/done/failed/cancelled，附 submit_count/worker_id/error）。
+    归属校验与取消接口一致：按"当前租户 + thread_id"复合键定位任务，
+    其他租户的同名 thread_id 查不到本租户的任务（404）。
+    """
+    validate_thread_id(thread_id)
+    task_key = composite_task_key(principal.user_id, thread_id)
+    try:
+        return await task_service.get_task_status(task_key, thread_id)
+    except TaskNotFoundError:
+        raise HTTPException(status_code=404, detail="任务不存在或已结束")
 
 
 @app.post("/api/upload")
@@ -610,13 +613,51 @@ async def websocket_endpoint(websocket: WebSocket, thread_id: str):
     # 补发完成后再按复合键注册，monitor 后续才能把事件定向推给当前页面
     manager.register(websocket, routing_key)
 
+    # ------------------------------------------------------------------
+    # P0-2 阶段 1 事件轮询桥：任务改由 worker 进程执行后，Agent 事件经
+    # 共享 event_store（同机磁盘 events.sqlite3，worker 写 / 本进程读）
+    # 到达本进程。注册连接后追加后台轮询任务，每 EVENT_POLL_SECONDS 读一次
+    # 差量推给本连接——与上方 P0-3 补发同构。阶段 2 引入 Redis pub/sub 后，
+    # 本轮询任务整体替换为订阅回调，是唯一的替换点。
+    # 注：inline 模式下 monitor 的实时直推仍然生效，轮询桥推送的重复事件
+    # 由前端按 seq 去重（与 P0-3 补发重叠窗口同一机制）。
+    # ------------------------------------------------------------------
+    send_lock = asyncio.Lock()
+    # 轮询起点：补发批次走完了取最后一条的 seq；显式 last_seq 从它开始；
+    # 两者皆无（首连且无历史）时传 None，read_after 会返回该键的最近事件
+    poll_last_seq = replayed[-1]["seq"] if replayed else last_seq
+
+    async def _poll_event_store() -> None:
+        """后台轮询共享事件库，把 worker 产生的新事件推给本连接"""
+        nonlocal poll_last_seq
+        try:
+            while True:
+                await asyncio.sleep(EVENT_POLL_SECONDS)
+                try:
+                    new_events = await event_store.read_after(
+                        routing_key, poll_last_seq
+                    )
+                except Exception as e:
+                    # 事件库瞬时故障不拆连接：本轮跳过，下轮重试
+                    logger.warning(f"[WebSocket] 事件轮询读取失败（本轮跳过）: {e}")
+                    continue
+                for event_payload in new_events:
+                    async with send_lock:
+                        await websocket.send_json(event_payload)
+                    poll_last_seq = event_payload["seq"]
+        except asyncio.CancelledError:
+            raise
+
+    poll_task = asyncio.create_task(_poll_event_store())
+
     try:
         while True:
             # 前端通常发送 ping 心跳；服务端回复 pong，顺便维持连接活跃
             data = await websocket.receive_text()
-            await websocket.send_json(
-                {"type": "pong", "message": f"服务端已收到: {data}"}
-            )
+            async with send_lock:
+                await websocket.send_json(
+                    {"type": "pong", "message": f"服务端已收到: {data}"}
+                )
 
     except WebSocketDisconnect:
         # 只移除当前 WebSocket 实例，避免旧连接断开时误删同 thread_id 的新连接
@@ -626,6 +667,14 @@ async def websocket_endpoint(websocket: WebSocket, thread_id: str):
     except Exception as e:
         logger.error(f"[WebSocket] 连接异常: {e}", exc_info=True)
         manager.disconnect(websocket, routing_key)
+
+    finally:
+        # 断开/异常后必须停掉事件轮询，避免后台任务泄漏并持续向死连接发送
+        poll_task.cancel()
+        try:
+            await poll_task
+        except asyncio.CancelledError:
+            pass
 
 
 if __name__ == "__main__":

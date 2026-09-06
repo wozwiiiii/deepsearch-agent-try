@@ -15,7 +15,7 @@ import io
 import pytest
 from fastapi.testclient import TestClient
 
-from app.api import server
+from app.api import server, task_service
 
 
 @pytest.fixture(autouse=True)
@@ -30,7 +30,8 @@ def client(monkeypatch):
     async def _noop_agent(*args, **kwargs):
         return None
 
-    monkeypatch.setattr(server, "run_deep_agent", _noop_agent)
+    # P0-2 阶段 1：inline 执行逻辑迁入 task_service，patch 点随迁
+    monkeypatch.setattr(task_service, "run_deep_agent", _noop_agent)
     return TestClient(server.app)
 
 

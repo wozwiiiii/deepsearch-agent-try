@@ -13,7 +13,7 @@ import pytest
 from fastapi.testclient import TestClient
 from slowapi.util import get_remote_address
 
-from app.api import server
+from app.api import server, task_service
 
 
 @pytest.fixture(autouse=True)
@@ -28,7 +28,8 @@ def client(monkeypatch):
     async def _noop_agent(*args, **kwargs):
         return None
 
-    monkeypatch.setattr(server, "run_deep_agent", _noop_agent)
+    # P0-2 阶段 1：inline 执行逻辑迁入 task_service，patch 点随迁
+    monkeypatch.setattr(task_service, "run_deep_agent", _noop_agent)
     # 每个用例前清空限流器内存状态，避免用例间相互污染
     server.limiter.reset()
     yield TestClient(server.app)

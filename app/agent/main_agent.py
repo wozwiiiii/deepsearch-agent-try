@@ -84,6 +84,15 @@ MODEL_THREAD_LIMIT = int(os.getenv("MODEL_THREAD_LIMIT", "300"))
 # 超时取消内部执行流并经 monitor 告知前端；默认 600 秒，可用环境变量调整
 TASK_TIMEOUT_SECONDS = float(os.getenv("TASK_TIMEOUT_SECONDS", "600"))
 
+# 任务队列模式（P0-2 阶段 1，与 task_service 同一开关）：
+# inline（默认）→ AsyncSqliteSaver（现状不动）；redis → AsyncPostgresSaver
+TASK_QUEUE_MODE = (os.getenv("TASK_QUEUE_MODE") or "inline").strip().lower() or "inline"
+# 队列模式下的 checkpointer DSN，与任务表共用同一 Postgres（见 .env.example）
+POSTGRES_DSN = (
+    os.getenv("POSTGRES_DSN")
+    or "postgresql://deepsearch:deepsearch@localhost:5433/deepsearch_tasks"
+)
+
 # 单次任务 token 预算（P1-4a 成本熔断）：调用次数上限（MODEL_RUN_LIMIT=80）
 # 不约束单次上下文长度——单任务理论消耗可达 80×32K≈256 万 token 无上限。
 # 此处按流式返回的 usage_metadata 累计，超预算立即终止任务。
@@ -128,10 +137,26 @@ async def _get_agent():
 
         # from_conn_string 返回异步上下文管理器；这里显式进入并保持到进程结束。
         # 注意 context manager 本身必须存入全局（见 _checkpoint_saver_ctx 注释），
-        # 否则被 GC 时会连带关闭正在服务的连接
-        saver_ctx = AsyncSqliteSaver.from_conn_string(str(db_path))
-        _checkpoint_saver_ctx = saver_ctx
-        _checkpoint_saver = await saver_ctx.__aenter__()
+        # 否则被 GC 时会连带关闭正在服务的连接——该 GC 陷阱对 PG 版同样适用
+        if TASK_QUEUE_MODE == "redis":
+            # 队列模式：checkpointer 换 AsyncPostgresSaver，多 worker 进程
+            # 共享会话状态。延迟导入：inline 默认路径不引入
+            # langgraph-checkpoint-postgres 依赖（未安装也不影响 inline 直跑）
+            from langgraph.checkpoint.postgres.aio import AsyncPostgresSaver
+
+            saver_ctx = AsyncPostgresSaver.from_conn_string(POSTGRES_DSN)
+            _checkpoint_saver_ctx = saver_ctx
+            _checkpoint_saver = await saver_ctx.__aenter__()
+            # 首次运行幂等建表（langgraph 官方约定），后续调用为 no-op
+            await _checkpoint_saver.setup()
+            saver_desc = f"postgres:{POSTGRES_DSN.rsplit('@', 1)[-1]}"
+        else:
+            db_path = Path(CHECKPOINT_DB)
+            db_path.parent.mkdir(parents=True, exist_ok=True)
+            saver_ctx = AsyncSqliteSaver.from_conn_string(str(db_path))
+            _checkpoint_saver_ctx = saver_ctx
+            _checkpoint_saver = await saver_ctx.__aenter__()
+            saver_desc = f"sqlite:{db_path}"
 
         _main_agent = create_deep_agent(
             model=model,
@@ -153,7 +178,8 @@ async def _get_agent():
             ],
         )
         logger.info(
-            f"[MainAgent] 已初始化，checkpointer=sqlite:{db_path}，"
+            f"[MainAgent] 已初始化，checkpointer={saver_desc}，"
+            f"任务队列模式={TASK_QUEUE_MODE}，"
             f"模型调用上限 run={MODEL_RUN_LIMIT}/thread={MODEL_THREAD_LIMIT}"
         )
         return _main_agent

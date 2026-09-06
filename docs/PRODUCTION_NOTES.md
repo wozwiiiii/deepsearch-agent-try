@@ -183,6 +183,29 @@
 
 ## 六、如何验证
 
+### 启动 ARQ worker（P0-2 阶段 1，任务执行出进程）
+
+```bash
+# 1. 起基础设施（Postgres 任务表/checkpointer + Redis 队列）
+docker compose -f docker/docker-compose.yaml up -d postgres redis
+
+# 2. 配置环境变量（复制 .env.example 为 .env 后按需调整）
+#    TASK_QUEUE_MODE=redis
+#    REDIS_URL=redis://localhost:6379/0
+#    POSTGRES_DSN=postgresql://deepsearch:deepsearch@localhost:5433/deepsearch_tasks
+
+# 3. 启动 worker（独立进程，与 API 进程分离）
+uv run arq app.queue.worker.WorkerSettings
+#    Windows PowerShell 下等价：uv run python -m arq app.queue.worker.WorkerSettings
+```
+
+- `TASK_QUEUE_MODE` 未设置或 `inline` 时不依赖 Postgres/Redis，行为与单机版完全一致（存量 212 测试全绿的前提）；
+- worker 启动时自动重拾任务表中 pending/running 的任务（running 先重置为 pending 再入队；按 `task:{task_key}:{submit_count}` 确定性重建 job_id），重启不丢任务；
+- 落终态携带 worker_id 代际守卫：同会话替换（重提交）或恢复重置后，迟到的旧 worker 无法把新一轮任务误标为旧结果（含 done/cancelled 两条收尾路径）；
+- 取消经任务表生效：worker 每 `CANCEL_POLL_SECONDS`（默认 2s）轮询，发现 cancelled 或被替换后中止执行，等待清理分支跑完再落终态；取消接口对执行中的任务返回 `cancelling`；
+- 不自动重试（max_tries=1）：Agent 任务重试是真实花费且副作用非幂等，失败落任务表 error 字段，人工重提；
+- worker 进程执行任务的监控事件经共享 SQLite 事件库（同机磁盘 events.sqlite3）到达 API 进程，由 WS 端点的事件轮询桥（1s）推给前端——阶段 2 换 Redis pub/sub 时只需替换该轮询任务。
+
 ```bash
 # 后端全部测试（154 个用例：安全 90 + 认证/租户/令牌/限流 42 + 持久化/超时/预算 8 + 事件回放 14）
 # 分布：path_safety 14 / sql_guard 45 / api_security 31 / auth 35 / rate_limit 7 / checkpointer 8 / event_replay 14

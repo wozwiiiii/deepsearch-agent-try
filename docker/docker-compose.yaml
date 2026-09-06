@@ -44,5 +44,45 @@ services:
       retries: 10
       start_period: 30s
 
+  # P0-2 阶段 1：任务状态外置（tasks 表）+ AsyncPostgresSaver checkpointer。
+  # 仅 TASK_QUEUE_MODE=redis 时需要；inline 默认模式不依赖这两个服务
+  postgres:
+    image: postgres:16-alpine
+    container_name: deepsearch-postgres
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: deepsearch
+      POSTGRES_PASSWORD: deepsearch
+      POSTGRES_DB: deepsearch_tasks
+      TZ: Asia/Shanghai
+    ports:
+      # 默认映射 5433，避免和本机已有 Postgres 的 5432 冲突（与 .env.example 一致）
+      - "${POSTGRES_PORT:-5433}:5432"
+    volumes:
+      - deepsearch_pg_data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U deepsearch"]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+      start_period: 10s
+
+  # P0-2 阶段 1：ARQ 任务队列（Agent 执行出进程）
+  redis:
+    image: redis:7-alpine
+    container_name: deepsearch-redis
+    restart: unless-stopped
+    ports:
+      - "${REDIS_PORT:-6379}:6379"
+    volumes:
+      - deepsearch_redis_data:/data
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+
 volumes:
   deepsearch_mysql_data:
+  deepsearch_pg_data:
+  deepsearch_redis_data:
