@@ -31,6 +31,12 @@ from app.agent.final_answer_guard import (
 )
 from app.agent.llm import model
 from app.agent.prompts import main_agent_content
+from app.agent.token_budget import (
+    MODEL_TOKEN_SESSION_LIMIT,
+    record_session_tokens,
+    session_budget_exceeded,
+)
+from app.agent.prompts import main_agent_content
 from app.agent.subagents.database_query_agent import database_query_agent
 from app.agent.subagents.knowledge_base_agent import knowledge_base_agent
 from app.agent.subagents.network_search_agent import network_search_agent
@@ -174,6 +180,19 @@ async def close_main_agent() -> None:
             logger.warning(f"[MainAgent] 关闭 checkpointer 时异常（忽略）: {e}")
 
 
+def _thread_id_of(config: dict) -> str:
+    """从任务 config 提取 thread_id（会话级 token 预算的累计维度）
+
+    config 结构由 run_deep_agent 构造（configurable.thread_id）；结构
+    异常时返回占位串，退化为全进程共享一个累计桶——熔断只会更严格，
+    不会失效。
+    """
+    try:
+        return str(config["configurable"]["thread_id"])
+    except (KeyError, TypeError):
+        return "<no-thread-id>"
+
+
 async def _consume_agent_stream(agent_factory, message: str, config: dict) -> None:
     """
     执行主智能体并消费其流式输出（原 run_deep_agent 的内联循环）
@@ -239,10 +258,23 @@ async def _consume_agent_stream(agent_factory, message: str, config: dict) -> No
                         usage = getattr(msg, "usage_metadata", None)
                         if usage:
                             # total_tokens 缺失时按 input+output 兜底
-                            tokens_used += usage.get("total_tokens") or (
+                            round_tokens = usage.get("total_tokens") or (
                                 usage.get("input_tokens", 0)
                                 + usage.get("output_tokens", 0)
                             )
+                            tokens_used += round_tokens
+                            # 会话级累计（P1：跨任务预算）。thread_id 从
+                            # config 取——同一会话的多次任务在此累计，
+                            # 超限抛 RuntimeError 与 run 级熔断同路径上报
+                            session_total = record_session_tokens(
+                                _thread_id_of(config), round_tokens
+                            )
+                            if session_budget_exceeded(session_total):
+                                raise RuntimeError(
+                                    f"会话 token 累计消耗 {session_total} 已超过"
+                                    f"预算上限 {MODEL_TOKEN_SESSION_LIMIT}，"
+                                    "任务终止"
+                                )
                     last_msg = messages[-1]
                     if node_name == "model":
                         if last_msg.tool_calls:
