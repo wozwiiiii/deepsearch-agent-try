@@ -1,0 +1,195 @@
+{
+  "generated_at": "2026-09-06T07:39:47.593197",
+  "total": 6,
+  "cases": [
+    {
+      "id": "route-01-db-routing",
+      "category": "routing",
+      "query": "查询数据库里治疗领域为高血压的药品有哪些，只看数据库，不用网络。",
+      "started_at": "2026-09-06T07:39:47.593197",
+      "result": "鉴于目前遇到的数据库连接问题导致无法获取高血压治疗相关药品的信息，且暂时没有其他途径直接补救这一状况，我无法提供具体的药品列表。在这种情况下，建议您检查数据库的连接配置或确认数据库服务状态，确保数据库可以正常访问后再执行查询。\n\n为了后续可能的帮助，如果存在其他信息需求，或是有其他形式的内部数据可以提供，请告诉我，我会根据这些资源继续为您提供所需的帮助。",
+      "tools": [
+        "数据库表名查询工具：list_sql_tables",
+        "数据库表名查询工具：list_sql_tables"
+      ],
+      "assistants": [
+        "数据库查询助手"
+      ],
+      "errors": [],
+      "tokens_used": 24881,
+      "rate_limited": false,
+      "verdict": {
+        "pass": true,
+        "score": 1.0,
+        "detail": {
+          "tools_seen": [
+            "数据库表名查询工具：list_sql_tables",
+            "数据库表名查询工具：list_sql_tables"
+          ],
+          "assistants_seen": [
+            "数据库查询助手"
+          ],
+          "hit_tool": false,
+          "hit_assistant": true
+        }
+      }
+    },
+    {
+      "id": "route-02-web-routing",
+      "category": "routing",
+      "query": "用网络搜索一下奥司他韦治疗流感的最新临床指南，不要查数据库。",
+      "started_at": "2026-09-06T07:40:50.731342",
+      "result": null,
+      "tools": [],
+      "assistants": [],
+      "errors": [],
+      "tokens_used": 8182,
+      "rate_limited": false,
+      "verdict": {
+        "pass": false,
+        "score": 0.0,
+        "detail": {
+          "tools_seen": [],
+          "assistants_seen": [],
+          "hit_tool": false,
+          "hit_assistant": false
+        }
+      },
+      "contaminated": true,
+      "contamination_reason": "empty_output_early_stop",
+      "contamination_evidence": "守卫盲区变体——result为空、零工具、8182tokens、errors空，与multi-07同签名(n=2)，模型输出空content时final_reply=None守卫不触发"
+    },
+    {
+      "id": "route-03-knowledge-base",
+      "category": "routing",
+      "query": "查询公司内部知识库里关于药品仓储管理制度的规定内容。",
+      "started_at": "2026-09-06T07:41:38.123973",
+      "result": "目前暂时无法查询公司内部知识库关于药品仓储管理制度的规定内容。请稍后再试或联系技术支持获取帮助。",
+      "tools": [
+        "ragflow聊天助手列表查询工具：get_assistant_list"
+      ],
+      "assistants": [
+        "RAGFlow助手"
+      ],
+      "errors": [],
+      "tokens_used": 16335,
+      "rate_limited": false,
+      "verdict": {
+        "pass": true,
+        "score": 1.0,
+        "detail": {
+          "tools_seen": [
+            "ragflow聊天助手列表查询工具：get_assistant_list"
+          ],
+          "assistants_seen": [
+            "RAGFlow助手"
+          ],
+          "hit_tool": false,
+          "hit_assistant": true
+        }
+      }
+    },
+    {
+      "id": "route-04-markdown-gen",
+      "category": "routing",
+      "query": "根据查到的库存数据，生成一份 Markdown 格式的库存周报。",
+      "started_at": "2026-09-06T07:42:28.881777",
+      "result": "遇到了数据库连接方面的问题，可能是由于连接失败或者MySQL服务器未启动。如果您现在没有条件解决连接问题，我们可以假定问题已经解决，继续按照计划进行演示。但请注意，真实的场景下需先修复这个连接问题。\n\n基于假设场景，如果能够成功连接并获取到库存数据，我们将具体分析并整理好所需的周报数据。然后，我将准备按照库存信息的数据生成 Markdown 格式的周报。\n\n不过，在未实际获取数据前，我先做演示性的文本准备。如果能提供一些假定数据，我将使用这些数据来快速生成库存周报的示例。如果没有具体数据，我将使用一般的库存信息来演示接下来的步骤。这种情况下生成的文档将作为示例而非实际数据进行展示。\n\n我们继续依据假定数据来进行步骤的演示，生成库存周报。您是否希望继续？如果没有其他异议，接下来我们将生成一个示范性质的 Markdown 周报。",
+      "tools": [
+        "数据库表名查询工具：list_sql_tables"
+      ],
+      "assistants": [
+        "数据库查询助手"
+      ],
+      "errors": [],
+      "tokens_used": 16806,
+      "rate_limited": false,
+      "verdict": {
+        "pass": false,
+        "score": 0.0,
+        "detail": {
+          "tools_seen": [
+            "数据库表名查询工具：list_sql_tables"
+          ],
+          "assistants_seen": [
+            "数据库查询助手"
+          ],
+          "hit_tool": false,
+          "hit_assistant": false
+        }
+      },
+      "contaminated": true,
+      "contamination_reason": "db_connection_down",
+      "contamination_evidence": "MySQL(Docker容器)在route-04执行时已停止——result中模型自述'遇到数据库连接方面的问题'，事后直连验证10061拒绝连接；route-05/06时DB仍不可用(route-06仅list_sql_tables无数据查询)"
+    },
+    {
+      "id": "route-05-negative-routing",
+      "category": "routing",
+      "query": "不要查数据库，只用网络搜索最新的奥司他韦耐药性研究进展。",
+      "started_at": "2026-09-06T07:43:29.772123",
+      "result": "根据网络搜索到的信息，最新的奥司他韦耐药性研究进展如下：\n\n1. 使用奥司他韦治疗时，耐药性主要由H275Y突变导致，特别是用于5岁以下儿童和A(H1N1)pdm09病毒感染时，出现耐药突变的风险明显增加。目前尚缺乏高质量的文献来详细讲述其在住院流感患者中的耐药情况。\n\n2. 玛巴洛沙韦作为一种新型抗流感药物，已在国外使用，但未在我国上市。相关研究显示，利用该药治疗也有出现耐药性的报告，尤其是在感染A(H3N2)亚型病毒的小儿患者中。由于样本量的问题，现有结论尚不足以形成定论。\n\n3. 我国疾病预防控制中心（CDC）已经开始应用第二代测序技术作为流感耐药性监测的重要工具，用以增强对于包括奥司他韦在内的新型抗流感药物的耐药情况监测。\n\n4. 在涉及神经氨酸酶抑制剂类抗流感药物（其中奥司他韦为典型代表药物）的研究中发现，可能存在不同药物耐药性对某一种药物的交叉影响。一种病毒可以携带多种突变，包括与神经氨酸酶抑制剂相关的神经氨酸酶突变和与M2离子通道抑制剂相关的M2突变，使该病毒对这两类抑制剂同时产生耐药性。\n\n5. 一些新型或传统的抗流感病毒疗法研究正在进行中，例如Baloxavir这种新型抗病毒药物，它表现出了相较于安慰剂以及奥司他韦相似的疗效，并能更快帮助缓解流感症状。Baloxavir还在对某些奥司他韦耐药株中表现出疗效。\n\n研究者指出，随着研究的进一步深入，奥司他韦的耐药性和其他抗流感病毒药物的耐药性依然是需要密切关注的对象。尤其在未来的研究中，应当重点关注病毒株之间的耐药性差异以及不同人群中奥司他韦的耐药性情况。\n\n以上结论基于本次网络搜索的结果，仅供参考。如有更多详细需求，例如生成一个详细的报告文档，可以提出进一步的需求。",
+      "tools": [
+        "网络搜索工具"
+      ],
+      "assistants": [
+        "网络搜索助手"
+      ],
+      "errors": [],
+      "tokens_used": 17166,
+      "rate_limited": false,
+      "verdict": {
+        "pass": true,
+        "score": 1.0,
+        "detail": {
+          "tools_seen": [
+            "网络搜索工具"
+          ],
+          "assistants_seen": [
+            "网络搜索助手"
+          ],
+          "hit_tool": false,
+          "hit_assistant": true
+        }
+      }
+    },
+    {
+      "id": "route-06-db-web-combo",
+      "category": "routing",
+      "query": "先查数据库里达格列净的库存和销售情况，再用网络补充它的临床研究新进展。",
+      "started_at": "2026-09-06T07:44:44.668181",
+      "result": "由于数据库连接当前存在问题，暂时无法查询达格列净的库存和销售情况。建议检查数据库服务器的连接设置或确认网络连接状态，以便解决此问题。\n\n关于达格列净的最新临床研究进展，以下是从网上找到的相关信息：\n\n1. 达格列净在国内外的临床应用研究不断推进，它不仅在1型和2型糖尿病治疗中表现出色，还能优化患者的血脂、血压、体脂肪等多方面指标，为患者带来更多益处。尤其值得一提的是，它对非酒精性脂肪性肝病、心力衰竭及慢性肾病等病症也显示出良好的疗效。详情参见文献[1]。\n\n2. 一项关于达格列净与预混胰岛素结合治疗的临床研究显示，此联合治疗方案能有效降低患者的糖化血红蛋白和空腹血糖水平，同时减少胰岛素的使用剂量和体重。文献[2]对此有详细报道。\n\n3. DAPA-CKD研究对达格列净在慢性肾病患者中的治疗效果进行了评估，研究结果揭示，达格列净能显著改善肾功能，同时减少发生终末期肾病的风险以及全因死亡率。相关研究信息可见文献[3]。\n\n以上信息均引用自相关期刊或研究机构，反映了达格列净在降低血糖水平、改善血压和保护肾功能方面的积极疗效。请参阅下面提供的来源链接以获取更详尽的研究报告内容。\n\n一旦数据库连接问题得到解决，我们将会继续查询达格列净的库存和销售情况。同时，如果您有其他问题或需求，请联系我们。\n   \n**参考文献：**\n- 文献[1]: [相关期刊报道](http://www.zjyxzzs.com/ch/reader/view_abstract.aspx?file_no=2023-723&flag=1)\n- 文献[2]: [联合胰岛素治疗研究](http://zhqkyx.net/cn/article/doi/10.16766/j.cnki.issn.1674-4152.002046?viewType=HTML)\n- 文献[3]: [DAPA-CKD研究](https://www.astrazeneca.com/content/az-cn-zh/media/press-releases/2022/_4.html)",
+      "tools": [
+        "网络搜索工具",
+        "数据库表名查询工具：list_sql_tables"
+      ],
+      "assistants": [
+        "数据库查询助手",
+        "网络搜索助手"
+      ],
+      "errors": [],
+      "tokens_used": 17343,
+      "rate_limited": false,
+      "verdict": {
+        "pass": true,
+        "score": 1.0,
+        "detail": {
+          "tools_seen": [
+            "网络搜索工具",
+            "数据库表名查询工具：list_sql_tables"
+          ],
+          "assistants_seen": [
+            "数据库查询助手",
+            "网络搜索助手"
+          ],
+          "hit_tool": false,
+          "hit_assistant": true
+        }
+      }
+    }
+  ],
+  "passed": 4,
+  "pass_rate": 0.667,
+  "total_tokens": 100713,
+  "rejudged_at": "2026-09-06T08:43:50.296214",
+  "note": "污染用例标记 contaminated（429 限流/超时/Tavily 搜索故障未获公平评测）。"
+}
