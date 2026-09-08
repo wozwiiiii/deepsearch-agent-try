@@ -79,3 +79,13 @@ docs/INDEX.md
 # 技术文档仅本地保存（2026-09-06 用户指定：docs 仅 knowledge_base/images 进远端）
 docs/*.md
 docs/**/*.md
+
+# 评测报告产物统一放 eval/reports/（2026-09-08 整理；根目录不再散落）
+/eval-report-*.json
+/eval-report-*.json.bak
+eval/reports/
+
+# 评测报告产物统一放 eval/reports/（2026-09-08 整理；根目录不再散落）
+/eval-report-*.json
+/eval-report-*.json.bak
+eval/reports/
